@@ -1,4 +1,4 @@
-"""CLI entrypoint for gpe-sre-ai-meeting-transcribe."""
+"""CLI entrypoint for ai-meeting-scribe."""
 
 import argparse
 import os

@@ -126,7 +126,7 @@ This captures only meeting audio (what others say). Your voice won't be recorded
 ## Quick Start
 
 ```bash
-cd gpe-sre-ai-meeting-transcribe
+cd ai-meeting-scribe
 
 # Install
 uv sync
@@ -202,7 +202,7 @@ The default summary includes: **Summary**, **Key Discussion Points**, **Decision
 ## Install globally (run from anywhere)
 
 ```bash
-cd gpe-sre-ai-meeting-transcribe
+cd ai-meeting-scribe
 uv tool install .
 
 # Now run from any directory:
