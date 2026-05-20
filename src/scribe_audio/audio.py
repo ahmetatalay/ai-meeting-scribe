@@ -5,6 +5,25 @@ import numpy as np
 import sounddevice as sd
 
 
+def get_system_audio() -> dict:
+    """Get current macOS default input and output audio devices.
+
+    Returns:
+        {"input": {"id": int, "name": str} | None,
+         "output": {"id": int, "name": str} | None}
+    """
+    devices = sd.query_devices()
+    default_in, default_out = sd.default.device
+    result = {"input": None, "output": None}
+    if default_in is not None and default_in >= 0:
+        d = devices[default_in]
+        result["input"] = {"id": default_in, "name": d["name"]}
+    if default_out is not None and default_out >= 0:
+        d = devices[default_out]
+        result["output"] = {"id": default_out, "name": d["name"]}
+    return result
+
+
 def list_devices() -> list[dict]:
     """List all available audio input devices."""
     devices = sd.query_devices()

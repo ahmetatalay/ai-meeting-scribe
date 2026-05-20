@@ -7,8 +7,9 @@ import signal
 import subprocess
 import sys
 
-from .audio import AudioCapture, find_device, list_devices
+from .audio import AudioCapture, find_device, get_system_audio, list_devices
 from .dedup import extract_new_text
+from .doctor import run_doctor
 from .speakers import label_segments
 from .transcriber import Transcriber
 from .writer import TranscriptWriter
@@ -72,6 +73,15 @@ def cmd_record(args):
         running = False
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    # Show current system audio
+    sys_audio = get_system_audio()
+    out_name = sys_audio["output"]["name"] if sys_audio["output"] else "None"
+    in_name = sys_audio["input"]["name"] if sys_audio["input"] else "None"
+    print(f"[main] System Output: {out_name}")
+    print(f"[main] System Input:  {in_name}")
+    if sys_audio["output"] and "meeting capture" not in out_name.lower():
+        print(f"[main] ⚠ Output is NOT Meeting Capture — meeting audio won't be captured!")
 
     # Start capture loop
     capture.start()
@@ -260,6 +270,9 @@ def main():
     # --- devices ---
     sub.add_parser("devices", help="List available audio input devices")
 
+    # --- doctor ---
+    sub.add_parser("doctor", help="Diagnose audio setup (BlackHole, devices, routing)")
+
     # --- record ---
     rec = sub.add_parser("record", help="Start recording and transcribing")
     rec.add_argument("--device", "-d", default=None,
@@ -297,6 +310,8 @@ def main():
 
     if args.command == "devices":
         cmd_devices(args)
+    elif args.command == "doctor":
+        run_doctor()
     elif args.command == "record":
         cmd_record(args)
     elif args.command == "summarize":

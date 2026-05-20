@@ -131,6 +131,9 @@ cd ai-meeting-scribe
 # Install
 uv sync
 
+# Check audio setup
+uv run scribe doctor
+
 # List audio devices
 uv run scribe devices
 
@@ -270,9 +273,20 @@ This is faster and more accurate than ML diarization because it uses physical se
 
 ### Headset disconnected/reconnected and audio stopped working
 This is a known macOS limitation with Aggregate and Multi-Output devices.
-1. Open **Audio MIDI Setup**
-2. Click on **Meeting Capture** and **Meeting Input**
-3. Uncheck and re-check your headset/mic
-4. If that doesn't work, delete the device and recreate it
+1. Run `scribe doctor` to see what's broken
+2. Open **Audio MIDI Setup**
+3. Click on **Meeting Capture** and **Meeting Input**
+4. Uncheck and re-check your headset/mic
+5. If that doesn't work, delete the devices and recreate them
+6. If BlackHole stops working: `brew reinstall blackhole-2ch` then restart macOS
+7. If audio daemon is stuck: `sudo killall coreaudiod` (restarts automatically)
 
 To avoid this issue, use **Option B** (simple setup) which only requires BlackHole.
+
+### Quick diagnostic
+
+```bash
+scribe doctor
+```
+
+This checks BlackHole, aggregate devices, and audio routing — and tells you exactly what to fix.
