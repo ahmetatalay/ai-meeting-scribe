@@ -116,6 +116,31 @@ class TestWindowing:
         win = cap.get_window(timeout=0)
         assert win is not None
         assert win.sample_rate == SR
+        # Only one second of audio exists, so that is the window: the leading
+        # zero padding is trimmed rather than handed to the transcriber.
+        assert win.duration == pytest.approx(1.0)
+
+    def test_leading_zero_padding_is_trimmed(self):
+        """A mostly-zero window is a degenerate input for Whisper's VAD and
+        can cost the opening words of the first sentence."""
+        clock = FakeClock()
+        cap = make_capture(clock, window=2.0, step=1.0)
+        feed_both(cap, clock, seconds=1.2, mic_value=0.5)
+
+        win = cap.get_window(timeout=0)
+        assert win is not None
+        # Shorter than the full window, because that much audio does not exist
+        # yet — but at least a step's worth.
+        assert 1.0 <= win.duration < 2.0
+        # No silent run at the front; every sample is real audio.
+        assert float(np.min(np.abs(win.mic))) > 0.0
+
+    def test_full_window_is_kept_once_enough_audio_exists(self):
+        clock = FakeClock()
+        cap = make_capture(clock, window=2.0, step=1.0)
+        feed_both(cap, clock, seconds=4.0, mic_value=0.3)
+
+        win = cap.get_window(timeout=0)
         assert win.duration == pytest.approx(2.0)
 
     def test_windows_arrive_once_per_step(self):

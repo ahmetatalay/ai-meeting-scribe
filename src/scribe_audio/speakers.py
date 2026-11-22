@@ -220,6 +220,10 @@ def label_segments(
             "start": seg["start"],
             "end": seg["end"],
             "reason": decision.reason,
+            # Carried through so a UI can answer "why was this labelled that?"
+            # without re-running the analysis.
+            "mic_db": round(decision.mic_prominence_db, 1),
+            "meeting_db": round(decision.meeting_prominence_db, 1),
         })
 
     return merge_runs(labelled)

@@ -257,6 +257,66 @@ class TestSimulatedConversation:
         assert got.count(SPEAKER_MEETING) == 20
 
 
+class TestSpeakingOverContinuousAudio:
+    """Talking while the other side never stops — a video, or a monologue.
+
+    This is the case where "You" goes missing: the meeting channel is loud for
+    the entire window, so there is no quiet reference inside it.
+    """
+
+    def _headset(self, speaking: bool, seed: int = 0) -> np.ndarray:
+        # A close-talking headset mic: very low floor, loud when used.
+        loud = (3.0, 7.0, 0.09) if speaking else None
+        return channel(10.0, base_rms=0.00008, loud=loud, seed=seed)
+
+    def test_your_interjection_is_credited_to_you(self):
+        mic = self._headset(speaking=True, seed=1)
+        # Continuous programme audio, loud for the whole window.
+        meeting = channel(10.0, base_rms=0.05, seed=2)
+
+        det = calibrated(mic, meeting)
+        decision = det.classify(mic, meeting, 3.0, 7.0, SR)
+
+        assert decision.speaker == SPEAKER_YOU, decision.reason
+
+    def test_staying_quiet_leaves_it_with_the_meeting(self):
+        mic = self._headset(speaking=False, seed=1)
+        meeting = channel(10.0, base_rms=0.05, seed=2)
+
+        det = calibrated(mic, meeting)
+        det._last_speaker = SPEAKER_MEETING
+        assert det.classify(mic, meeting, 3.0, 7.0, SR).speaker == SPEAKER_MEETING
+
+    def test_still_works_after_a_long_one_sided_stretch(self):
+        """The floor tracker rises slowly; it must not swallow you later on."""
+        det = SpeakerDetector()
+        quiet_mic = self._headset(speaking=False, seed=5)
+        loud_meeting = channel(10.0, base_rms=0.05, seed=6)
+
+        for _ in range(30):                      # you listen for a long time
+            det.observe(quiet_mic, loud_meeting, SR)
+
+        speaking_mic = self._headset(speaking=True, seed=7)
+        det.observe(speaking_mic, loud_meeting, SR)
+        decision = det.classify(speaking_mic, loud_meeting, 3.0, 7.0, SR)
+
+        assert decision.speaker == SPEAKER_YOU, decision.reason
+
+    def test_decision_carries_its_numbers(self):
+        """The UI shows these, so they have to be populated."""
+        mic = self._headset(speaking=True, seed=1)
+        meeting = channel(10.0, base_rms=0.05, seed=2)
+        det = calibrated(mic, meeting)
+
+        out = label_segments(
+            [{"start": 3.0, "end": 7.0, "text": "my interjection"}],
+            mic, meeting, SR, det,
+        )
+        assert out[0]["reason"]
+        assert isinstance(out[0]["mic_db"], float)
+        assert isinstance(out[0]["meeting_db"], float)
+
+
 class TestMergeRuns:
     def test_consecutive_same_speaker_merges(self):
         runs = merge_runs([

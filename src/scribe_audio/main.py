@@ -199,6 +199,24 @@ def _render_summary(event: dict) -> None:
         print(f"[main] Lost {stats['dropped_seconds']}s of audio to slow transcription.")
 
 
+def cmd_web(args) -> None:
+    """Run the local web UI."""
+    try:
+        from .web.server import DEFAULT_PORT, serve
+    except ImportError:
+        print("[web] The web UI needs the 'web' extra:")
+        print("        uv sync --extra web          (in a checkout)")
+        print("        uv tool install '.[web]'     (installed globally)")
+        sys.exit(1)
+
+    serve(
+        raw_dir=args.raw or os.environ.get("SCRIBE_RAW_DIR", "./raw"),
+        port=args.port or DEFAULT_PORT,
+        model=args.model,
+        open_browser=not args.no_browser,
+    )
+
+
 def _deprecated(parser) -> None:
     """Explain the retired aggregate-device flags instead of 'unrecognized argument'."""
     for flag in ("--device", "--device-id", "--mic-channel"):
@@ -216,6 +234,15 @@ def main() -> None:
 
     sub.add_parser("devices", help="List audio input and output devices")
     sub.add_parser("doctor", help="Diagnose the audio setup")
+
+    web = sub.add_parser("web", help="Open the local web UI (loopback only)")
+    web.add_argument("--port", type=int, default=None, help="Port (default: 8765)")
+    web.add_argument("--raw", "-r", default=None,
+                     help="Output directory (default: $SCRIBE_RAW_DIR or ./raw)")
+    web.add_argument("--model", "-m", default="small",
+                     help="Default Whisper model offered in the UI")
+    web.add_argument("--no-browser", action="store_true",
+                     help="Do not open a browser window")
 
     rec = sub.add_parser("record", help="Start recording and transcribing")
     rec.add_argument("--mic", default=None,
@@ -264,6 +291,8 @@ def main() -> None:
         run_doctor()
     elif args.command == "record":
         cmd_record(args)
+    elif args.command == "web":
+        cmd_web(args)
     else:
         parser.print_help()
 

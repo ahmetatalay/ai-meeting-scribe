@@ -420,6 +420,12 @@ class RecordingSession:
                     "text": s["text"],
                     "start": s.get("start"),
                     "end": s.get("end"),
+                    # Why this speaker was chosen — surfaced in the UI so an
+                    # unexpected label can be diagnosed from the transcript
+                    # itself rather than by re-recording with --debug.
+                    "reason": s.get("reason"),
+                    "mic_db": s.get("mic_db"),
+                    "meeting_db": s.get("meeting_db"),
                 }
                 for s in fresh
             ],

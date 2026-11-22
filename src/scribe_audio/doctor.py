@@ -59,12 +59,40 @@ def _test_loopback(device_name: str, seconds: float = 2.0) -> float:
     return float(np.sqrt(np.mean(audio**2)))
 
 
+def measure_microphone(device_id: int, seconds: float = 4.0) -> dict:
+    """Measure a microphone's quiet floor against its level while speaking.
+
+    Speaker attribution works on how far a channel rises above its *own* noise
+    floor, so this reports the same quantity the detector uses — which makes
+    "my voice is not being labelled" answerable without recording a meeting.
+    """
+    import sounddevice as sd
+
+    audio = sd.rec(int(seconds * 16000), samplerate=16000, channels=1,
+                   device=device_id, dtype="float32")
+    sd.wait()
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+
+    n = 3200  # 0.2s slices, matching the detector
+    usable = audio[: (audio.size // n) * n].reshape(-1, n)
+    rms = np.sqrt(np.mean(np.square(usable, dtype=np.float64), axis=1))
+
+    floor = float(np.percentile(rms, 5))
+    loud = float(np.percentile(rms, 95))
+    reference = max(floor, 1e-5)
+    return {
+        "floor": floor,
+        "loud": loud,
+        "prominence_db": 20.0 * np.log10(max(loud, 1e-12) / reference),
+    }
+
+
 def run_doctor() -> None:
     print(f"\n{BOLD}scribe doctor{RESET}\n")
     failures = 0
 
     # 1. Loopback device -----------------------------------------------------
-    print(f"{BOLD}[1/4] Loopback device{RESET}")
+    print(f"{BOLD}[1/5] Loopback device{RESET}")
     loopback = find_device(LOOPBACK_NAME, "input")
     if loopback:
         print(f"  {PASS}  {loopback.name} (device {loopback.id}, "
@@ -75,7 +103,7 @@ def run_doctor() -> None:
         failures += 1
 
     # 2. Output routing ------------------------------------------------------
-    print(f"\n{BOLD}[2/4] System output routing{RESET}")
+    print(f"\n{BOLD}[2/5] System output routing{RESET}")
     output = get_system_audio()["output"]
     out_name = output.name if output else "None"
     print(f"  Output: {BOLD}{out_name}{RESET}")
@@ -94,7 +122,7 @@ def run_doctor() -> None:
     print("    is the most common cause of a one-sided transcript.")
 
     # 3. Loopback carries audio ---------------------------------------------
-    print(f"\n{BOLD}[3/4] Loopback passes audio{RESET}")
+    print(f"\n{BOLD}[3/5] Loopback passes audio{RESET}")
     if loopback:
         try:
             rms = _test_loopback(loopback.name)
@@ -110,7 +138,7 @@ def run_doctor() -> None:
         failures += 1
 
     # 4. Microphone ----------------------------------------------------------
-    print(f"\n{BOLD}[4/4] Microphone{RESET}")
+    print(f"\n{BOLD}[4/5] Microphone{RESET}")
     default_in = get_system_audio()["input"]
     if default_in:
         print(f"  {PASS}  Default input: {default_in.name}")
@@ -126,6 +154,30 @@ def run_doctor() -> None:
         print("  Other inputs available for --mic:")
         for d in others[:8]:
             print(f"    - {d.name}")
+
+    # 5. Microphone level ----------------------------------------------------
+    print(f"\n{BOLD}[5/5] Microphone level{RESET}")
+    if default_in is not None:
+        print(f"  {BOLD}Speak normally for 4 seconds, starting now...{RESET}")
+        try:
+            m = measure_microphone(default_in.id)
+            margin = m["prominence_db"]
+            print(f"  Quiet floor: {m['floor']:.6f}   While speaking: {m['loud']:.6f}")
+            if margin >= 20:
+                print(f"  {PASS}  Your voice sits {margin:.0f} dB above the floor")
+            elif margin >= 8:
+                print(f"  {WARN}  Only {margin:.0f} dB above the floor — labelling will")
+                print(f"         work but is marginal. Move the mic closer.")
+            else:
+                print(f"  {FAIL}  Just {margin:.0f} dB above the floor — your speech will")
+                print(f"         not be labelled 'You'.")
+                print(f"         Check the headset's inline mute switch and the input")
+                print(f"         volume in System Settings > Sound > Input.")
+                failures += 1
+        except Exception as exc:
+            print(f"  {WARN}  Could not measure: {exc}")
+    else:
+        print(f"  {WARN}  Skipped — no default input device")
 
     # Summary ----------------------------------------------------------------
     print(f"\n{BOLD}{'=' * 56}{RESET}")

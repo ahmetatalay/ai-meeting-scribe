@@ -73,11 +73,36 @@ scribe warns about this at runtime as soon as it sees your speech with a silent 
 ## Quick start
 
 ```bash
-uv sync
+uv sync --extra web
 
 scribe doctor      # check the audio setup
-scribe devices     # list inputs and outputs
-scribe record      # Ctrl+C to stop
+scribe web         # browser UI (recommended)
+scribe record      # or stay in the terminal; Ctrl+C to stop
+```
+
+## Web UI
+
+```bash
+scribe web                    # opens http://127.0.0.1:8765
+scribe web --port 9000
+scribe web --no-browser
+scribe web --raw ~/Desktop/transcripts
+```
+
+Pick your microphone and meeting-audio device, press **Start transcribing**, and the transcript appears as it is produced. Two live level meters sit under the controls — if the **Meeting** meter stays flat, the meeting audio is not reaching scribe and you can fix it in seconds instead of discovering it after the call.
+
+### Why it is loopback-only
+
+The server binds `127.0.0.1` and there is deliberately **no host option**, so it cannot be exposed by a stray flag. Transcripts are verbatim records of private conversations, so the localhost-specific attacks are treated as real:
+
+- **Host header validation** — a page you visit can point a hostname it controls at `127.0.0.1` (DNS rebinding) and then talk to the server as same-origin. Foreign `Host` values are refused.
+- **CSRF token** — the browser's same-origin policy stops another site *reading* responses but not *sending* a `POST`. Without a token, any page you had open could start or stop a recording. The token is minted per run, embedded in the page, and required on every route.
+- **No CORS headers**, and the API docs endpoints are disabled.
+
+To reach the UI from another machine, use an SSH local port-forward rather than widening the bind:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 your-mac
 ```
 
 ## Usage
@@ -193,7 +218,7 @@ scribe doctor
 ## Development
 
 ```bash
-uv sync --group dev
+uv sync --group dev --extra web
 uv run pytest
 ```
 
@@ -209,6 +234,8 @@ Layout:
 | `session.py` | Recording engine — owns the loop, publishes events |
 | `main.py` | CLI, rendering the engine's event stream |
 | `doctor.py` | Audio setup diagnostics |
+| `web/server.py` | Loopback web UI — FastAPI + SSE over the same event bus |
+| `web/static/index.html` | The whole front end: no build step, no dependencies |
 
 `session.py` is the headless core: it prints nothing and publishes `state`, `segments`, `levels`, `notice`, `session` and `summary` events. The CLI is one consumer of that stream.
 

@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>scribe</title>
+<style>
+  :root {
+    --bg: #fbfbfd;
+    --panel: #ffffff;
+    --border: #e3e3e8;
+    --text: #1d1d20;
+    --muted: #6e6e78;
+    --accent: #2f6df6;
+    --you: #2f6df6;
+    --them: #0f9d78;
+    --warn: #b0820c;
+    --warn-bg: #fdf6e3;
+    --err: #c8372d;
+    --err-bg: #fdecea;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a;
+      --panel: #1e1e23;
+      --border: #32323a;
+      --text: #ececf0;
+      --muted: #9a9aa6;
+      --accent: #5b8dff;
+      --you: #5b8dff;
+      --them: #3fcfa3;
+      --warn: #e9c46a;
+      --warn-bg: #2e2812;
+      --err: #ff6b5e;
+      --err-bg: #331a18;
+    }
+  }
+  * { box-sizing: border-box; }
+  /* The `hidden` attribute is honoured by the user-agent stylesheet, and author
+     styles beat the UA origin regardless of specificity. Any `display` rule
+     below would therefore un-hide its element — which it did, leaving the
+     "no meeting audio" warning and the empty footer on screen permanently. */
+  [hidden] { display: none !important; }
+  body {
+    margin: 0;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 22px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  h1 span { color: var(--muted); font-weight: 400; }
+  .spacer { flex: 1; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); flex: none;
+  }
+  .dot.live { background: var(--err); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.ok { background: var(--them); }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+  #state { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  main {
+    max-width: 1080px; margin: 0 auto; padding: 22px;
+    display: grid; gap: 18px; grid-template-columns: 320px 1fr;
+    align-items: start;
+  }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px;
+  }
+  .panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin: 0 0 12px; font-weight: 600;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
+  label:first-of-type { margin-top: 0; }
+  select, input[type=text] {
+    width: 100%; padding: 7px 9px; font-size: 13px; font-family: inherit;
+    border: 1px solid var(--border); border-radius: 7px;
+    background: var(--bg); color: var(--text);
+  }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; min-width: 0; }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 13px; margin-top: 12px; }
+  .check input { width: auto; margin: 0; }
+
+  button {
+    font: inherit; font-size: 14px; font-weight: 500;
+    padding: 9px 16px; border-radius: 8px; border: 1px solid transparent;
+    cursor: pointer; width: 100%; margin-top: 16px;
+    background: var(--accent); color: #fff;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.stop { background: var(--err); }
+
+  /* Level meters — the fastest way to see a broken audio route. */
+  .meter { margin-top: 14px; }
+  .meter-head {
+    display: flex; justify-content: space-between;
+    font-size: 11px; color: var(--muted); margin-bottom: 4px;
+  }
+  .meter-head b { font-weight: 600; color: var(--text); }
+  .bar {
+    height: 7px; border-radius: 4px; background: var(--border); overflow: hidden;
+  }
+  .bar i {
+    display: block; height: 100%; width: 0%;
+    background: var(--them); border-radius: 4px;
+    transition: width .1s linear;
+  }
+  .bar.mic i { background: var(--you); }
+  .meter.dead .bar i { background: var(--err); }
+  .meter small { display: block; font-size: 11px; color: var(--err); margin-top: 3px; }
+
+  .checks { font-size: 13px; }
+  .checks div { display: flex; gap: 7px; padding: 3px 0; align-items: baseline; }
+  .checks .mark { flex: none; width: 14px; }
+  .checks .pass { color: var(--them); }
+  .checks .fail { color: var(--warn); }
+  .checks em { color: var(--muted); font-style: normal; font-size: 12px; }
+  .hint {
+    font-size: 12px; color: var(--muted); margin-top: 10px;
+    padding-top: 10px; border-top: 1px solid var(--border);
+  }
+
+  #notices:empty { display: none; }
+  #pair-warn { margin: 14px 0 0; font-size: 12px; }
+  .notice {
+    padding: 10px 13px; border-radius: 8px; font-size: 13px;
+    margin-bottom: 10px; border: 1px solid transparent;
+  }
+  .notice.warning { background: var(--warn-bg); color: var(--warn); border-color: currentColor; }
+  .notice.error { background: var(--err-bg); color: var(--err); border-color: currentColor; }
+  .notice.info { background: var(--bg); color: var(--muted); border-color: var(--border); }
+
+  /* The transcript is its own scroll region: the page itself must not move
+     when new speech arrives, or reading anything becomes impossible. */
+  #transcript {
+    position: relative;
+    display: flex; flex-direction: column;
+    max-height: calc(100vh - 150px);
+    min-height: 320px;
+  }
+  #turns {
+    flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain;
+    scrollbar-width: thin;
+  }
+  #turns::-webkit-scrollbar { width: 9px; }
+  #turns::-webkit-scrollbar-thumb {
+    background: var(--border); border-radius: 5px;
+  }
+  /* "Jump to latest" appears only while scrolled away from the bottom, so
+     auto-scroll never yanks the view out from under someone reading. */
+  #jump {
+    position: absolute; left: 50%; bottom: 14px;
+    transform: translateX(-50%);
+    width: auto; margin: 0; padding: 6px 14px;
+    font-size: 12px; border-radius: 999px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, .2);
+  }
+  .turn { margin-bottom: 16px; }
+  .turn .who {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .06em; margin-bottom: 3px;
+  }
+  .turn.you .who { color: var(--you); }
+  .turn.them .who { color: var(--them); }
+  .turn .what { white-space: pre-wrap; }
+  .turn .what span.fresh { animation: fade .5s ease-out; }
+  /* Per-segment detection detail, revealed by the "Why?" toggle. */
+  .why { display: none; }
+  #turns.show-why .why {
+    display: block; font-family: var(--mono); font-size: 11px;
+    color: var(--muted); margin: 2px 0 6px;
+  }
+  @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+  .empty { color: var(--muted); font-size: 14px; text-align: center; padding: 70px 20px; }
+  .empty code { font-family: var(--mono); font-size: 12px; }
+
+  footer {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    font-size: 12px; color: var(--muted);
+    border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px;
+  }
+  footer code { font-family: var(--mono); font-size: 11px; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>scribe <span id="elapsed"></span></h1>
+  <span class="spacer"></span>
+  <span id="state">idle</span>
+</header>
+
+<main>
+  <div>
+    <div class="panel">
+      <h2>Audio</h2>
+      <label for="mic">Microphone — "You"</label>
+      <select id="mic"></select>
+
+      <label for="sys">Meeting audio — "Meeting"</label>
+      <select id="sys"></select>
+
+      <div class="row">
+        <div>
+          <label for="model">Model</label>
+          <select id="model">
+            <option value="tiny">tiny</option>
+            <option value="small" selected>small</option>
+            <option value="large-v3-turbo">large-v3-turbo</option>
+            <option value="medium">medium</option>
+            <option value="large-v3">large-v3</option>
+          </select>
+        </div>
+        <div>
+          <label for="lang">Language</label>
+          <select id="lang">
+            <option value="en" selected>English</option>
+            <option value="auto">Auto-detect</option>
+            <option value="tr">Türkçe</option>
+            <option value="de">Deutsch</option>
+            <option value="nl">Nederlands</option>
+          </select>
+        </div>
+      </div>
+
+      <label for="title">Title <em style="color:var(--muted)">(optional)</em></label>
+      <input type="text" id="title" placeholder="Meeting 2026-11-23 10:30" autocomplete="off">
+
+      <div class="check">
+        <input type="checkbox" id="speakers" checked>
+        <label for="speakers" style="margin:0">Label who is speaking</label>
+      </div>
+
+      <div class="notice warning" id="pair-warn" hidden></div>
+
+      <button id="go">Start transcribing</button>
+
+      <div class="meter" id="m-mic">
+        <div class="meter-head"><b>Mic</b><span id="v-mic">—</span></div>
+        <div class="bar mic"><i id="b-mic"></i></div>
+      </div>
+      <div class="meter" id="m-sys">
+        <div class="meter-head"><b>Meeting</b><span id="v-sys">—</span></div>
+        <div class="bar"><i id="b-sys"></i></div>
+        <small id="dead-sys" hidden>No meeting audio — check routing</small>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:18px">
+      <h2>Setup</h2>
+      <div class="checks" id="checks"></div>
+      <div class="hint" id="note"></div>
+    </div>
+  </div>
+
+  <div>
+    <div id="notices"></div>
+    <div class="panel" id="transcript">
+      <h2 style="display:flex;align-items:center;gap:10px">
+        Transcript
+        <span style="flex:1"></span>
+        <label style="margin:0;display:flex;align-items:center;gap:5px;
+                      text-transform:none;letter-spacing:0;cursor:pointer">
+          <input type="checkbox" id="why" style="width:auto;margin:0">Why?
+        </label>
+      </h2>
+      <div id="turns"></div>
+      <div class="empty" id="empty">
+        Pick your devices and press <code>Start transcribing</code>.
+      </div>
+      <button id="jump" hidden>↓ New speech</button>
+    </div>
+    <footer id="meta" hidden>
+      <span id="f-counts"></span>
+      <span><code id="f-path"></code></span>
+    </footer>
+  </div>
+</main>
+
+<script>
+const TOKEN = "__SCRIBE_TOKEN__";
+const $ = id => document.getElementById(id);
+
+async function api(path, opts = {}) {
+  const url = path + (opts.method ? "" : (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN));
+  const res = await fetch(url, {
+    ...opts,
+    headers: { ...(opts.headers || {}), "X-Scribe-Token": TOKEN,
+               ...(opts.body ? { "Content-Type": "application/json" } : {}) },
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (_) {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+/* ---------------------------------------------------------------- devices */
+
+let devices = null;
+
+async function loadDevices() {
+  devices = await api("/api/devices");
+  const mic = $("mic"), sys = $("sys");
+  mic.innerHTML = '<option value="">None — record meeting audio only</option>';
+  sys.innerHTML = '<option value="">None — record my microphone only</option>';
+
+  for (const d of devices.inputs) {
+    const name = d.name.replace(/ Series$/, "");
+    const isLoopback = d.id === devices.loopback_id;
+    mic.add(new Option(name, d.id));
+    sys.add(new Option(isLoopback ? `${name} — meeting audio` : name, d.id));
+  }
+
+  // Assigned after populating: setting `selected` on a detached <option>
+  // (the 4th argument to new Option) is not honoured reliably, which left
+  // both pickers on whichever device happened to be first.
+  if (devices.loopback_id !== null) sys.value = String(devices.loopback_id);
+  if (devices.default_input !== null && devices.default_input !== devices.loopback_id) {
+    mic.value = String(devices.default_input);
+  }
+  validateSelection();
+}
+
+/* The two streams must be different devices: pointing both at one input gives
+   identical signals, so speaker attribution has nothing to separate. */
+function validateSelection() {
+  const micId = $("mic").value, sysId = $("sys").value;
+  const clash = micId !== "" && micId === sysId;
+  const empty = micId === "" && sysId === "";
+
+  $("pair-warn").hidden = !clash && !empty;
+  if (clash) {
+    $("pair-warn").textContent =
+      "Microphone and meeting audio are the same device — pick BlackHole for " +
+      "meeting audio, or set one of them to None.";
+  } else if (empty) {
+    $("pair-warn").textContent = "Pick at least one device.";
+  }
+  if (!recording) $("go").disabled = clash || empty;
+}
+
+async function loadPreflight() {
+  const data = await api("/api/preflight");
+  $("checks").innerHTML = data.checks.map(c => `
+    <div>
+      <span class="mark ${c.ok ? "pass" : "fail"}">${c.ok ? "✓" : "!"}</span>
+      <span>${esc(c.label)}<br><em>${esc(c.detail || "")}${c.hint ? " — " + esc(c.hint) : ""}</em></span>
+    </div>`).join("");
+  $("note").textContent = data.note;
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ----------------------------------------------------------------- levels */
+
+// RMS is tiny and logarithmic in perception, so map dB rather than amplitude.
+function meterWidth(rms) {
+  if (!rms || rms <= 0) return 0;
+  const db = 20 * Math.log10(rms);
+  return Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+}
+
+let sawMeeting = false;
+
+function renderLevels(ev) {
+  const set = (bar, val, active) => {
+    $(bar).style.width = (active ? meterWidth(val) : 0) + "%";
+  };
+  set("b-mic", ev.mic, ev.mic_active);
+  set("b-sys", ev.meeting, ev.meeting_active);
+  $("v-mic").textContent = ev.mic_active ? fmtDb(ev.mic) : "off";
+  $("v-sys").textContent = ev.meeting_active ? fmtDb(ev.meeting) : "off";
+
+  if (ev.meeting > 1e-4) sawMeeting = true;
+  const dead = ev.meeting_active && !sawMeeting && recording;
+  $("m-sys").classList.toggle("dead", dead);
+  $("dead-sys").hidden = !dead;
+
+  for (const s of ev.stalled || []) {
+    $(s === "mic" ? "m-mic" : "m-sys").classList.add("dead");
+  }
+}
+
+function fmtDb(rms) {
+  if (!rms || rms <= 0) return "−∞";
+  return (20 * Math.log10(rms)).toFixed(0) + " dB";
+}
+
+/* ------------------------------------------------------------- transcript */
+
+let lastSpeaker = null;
+
+// How close to the bottom still counts as "following along".
+const STICK_THRESHOLD_PX = 80;
+
+function atBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
+}
+
+function scrollToLatest(smooth) {
+  const el = $("turns");
+  el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+  $("jump").hidden = true;
+}
+
+function addSegments(segments) {
+  $("empty").hidden = true;
+  // Decided before appending: afterwards the geometry has already changed.
+  const following = atBottom($("turns"));
+
+  for (const seg of segments) {
+    if (seg.speaker !== lastSpeaker) {
+      const turn = document.createElement("div");
+      turn.className = "turn " + (seg.speaker === "You" ? "you" : "them");
+      turn.innerHTML = `<div class="who">${esc(seg.speaker)}</div><div class="what"></div>`;
+      $("turns").append(turn);
+      lastSpeaker = seg.speaker;
+    }
+    const what = $("turns").lastElementChild.querySelector(".what");
+    const span = document.createElement("span");
+    span.className = "fresh";
+    span.textContent = (what.textContent ? " " : "") + seg.text;
+    what.append(span);
+
+    if (seg.reason) {
+      const why = document.createElement("div");
+      why.className = "why";
+      why.textContent =
+        `#${seg.id} ${seg.speaker} — mic +${fmt(seg.mic_db)}dB vs ` +
+        `meeting +${fmt(seg.meeting_db)}dB — ${seg.reason}`;
+      $("turns").lastElementChild.append(why);
+    }
+  }
+
+  if (following) scrollToLatest(false);
+  else $("jump").hidden = false;
+}
+
+function fmt(v) { return v === null || v === undefined ? "?" : v.toFixed(1); }
+
+function addNotice(ev) {
+  const el = document.createElement("div");
+  el.className = "notice " + ev.level;
+  el.textContent = ev.message;
+  $("notices").append(el);
+  if (ev.level === "info") setTimeout(() => el.remove(), 6000);
+}
+
+/* ------------------------------------------------------------------ state */
+
+let recording = false, startedAt = null, timer = null;
+
+function setState(value) {
+  $("state").textContent = value.replace(/_/g, " ");
+  recording = value === "recording";
+  const dot = $("dot");
+  dot.className = "dot" + (recording ? " live" : value === "stopped" ? " ok" : "");
+
+  $("go").textContent = recording ? "Stop" : "Start transcribing";
+  $("go").className = recording ? "stop" : "";
+  $("go").disabled = value === "loading_model" || value === "stopping";
+  for (const id of ["mic", "sys", "model", "lang", "title", "speakers"]) {
+    $(id).disabled = recording || value === "loading_model";
+  }
+
+  if (!recording) {
+    for (const id of ["m-mic", "m-sys"]) $(id).classList.remove("dead");
+    $("dead-sys").hidden = true;
+    $("b-mic").style.width = "0%";
+    $("b-sys").style.width = "0%";
+    $("v-mic").textContent = "—";
+    $("v-sys").textContent = "—";
+    sawMeeting = false;
+    validateSelection();
+  }
+
+  if (recording && !timer) {
+    startedAt = Date.now();
+    timer = setInterval(tick, 1000);
+  } else if (!recording && timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+}
+
+function tick() {
+  const s = Math.floor((Date.now() - startedAt) / 1000);
+  $("elapsed").textContent =
+    `· ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/* ------------------------------------------------------------------ events */
+
+function connect() {
+  const es = new EventSource("/api/events?token=" + encodeURIComponent(TOKEN));
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "levels") renderLevels(ev);
+    else if (ev.type === "segments") addSegments(ev.segments);
+    else if (ev.type === "state") setState(ev.value);
+    else if (ev.type === "notice") addNotice(ev);
+    else if (ev.type === "session" && ev.markdown) {
+      $("meta").hidden = false;
+      $("f-path").textContent = ev.markdown;
+    } else if (ev.type === "summary") {
+      const s = ev.stats;
+      const who = Object.entries(s.speakers).map(([k, v]) => `${k} ${v}`).join(", ");
+      $("f-counts").textContent =
+        `${s.segments} segments · ${s.words} words${who ? " · " + who : ""}`;
+    }
+  };
+  es.onerror = () => { /* EventSource reconnects on its own */ };
+}
+
+/* ------------------------------------------------------------------ actions */
+
+$("why").onchange = () =>
+  $("turns").classList.toggle("show-why", $("why").checked);
+
+$("jump").onclick = () => scrollToLatest(true);
+$("turns").onscroll = () => {
+  if (atBottom($("turns"))) $("jump").hidden = true;
+};
+
+$("mic").onchange = validateSelection;
+$("sys").onchange = validateSelection;
+
+$("go").onclick = async () => {
+  $("go").disabled = true;
+  try {
+    if (recording) {
+      await api("/api/stop", { method: "POST" });
+    } else {
+      $("turns").innerHTML = "";
+      $("notices").innerHTML = "";
+      $("jump").hidden = true;
+      lastSpeaker = null; sawMeeting = false;
+      await api("/api/start", {
+        method: "POST",
+        body: JSON.stringify({
+          mic_device: $("mic").value || null,
+          system_device: $("sys").value || null,
+          model: $("model").value,
+          language: $("lang").value,
+          title: $("title").value.trim() || null,
+          use_speakers: $("speakers").checked,
+        }),
+      });
+    }
+  } catch (err) {
+    addNotice({ level: "error", message: err.message });
+    $("go").disabled = false;
+  }
+};
+
+(async () => {
+  try {
+    await loadDevices();
+    await loadPreflight();
+  } catch (err) {
+    addNotice({ level: "error", message: "Could not read audio devices: " + err.message });
+  }
+  connect();
+  setInterval(() => { if (!recording) loadPreflight().catch(() => {}); }, 5000);
+})();
+</script>
+</body>
+</html>

@@ -365,6 +365,21 @@ class DualStreamCapture:
     def _build_window_locked(self, end: float) -> Window:
         mic = self.mic_buffer.read_window(end, self.window_duration)
         meeting = self.system_buffer.read_window(end, self.window_duration)
+
+        # Drop any leading region that predates the first captured sample.
+        # Measured effect: padding does not cost words, but it does make Whisper
+        # return one long segment where trimmed audio returns several. Finer
+        # segments give speaker attribution more to work with, since each one
+        # gets its own decision. All three arrays are trimmed identically, so
+        # segment timestamps stay aligned with the attribution channels.
+        window_start = end - self.window_duration
+        if self._first_time is not None and self._first_time > window_start:
+            skip = int(round((self._first_time - window_start) * self.sample_rate))
+            skip = max(0, min(skip, mic.size - 1))
+            if skip:
+                mic = mic[skip:]
+                meeting = meeting[skip:]
+
         # Sum rather than average: averaging halves a lone speaker's level and
         # can push a quiet talker under the downstream silence gate.
         mono = np.clip(mic + meeting, -1.0, 1.0)
