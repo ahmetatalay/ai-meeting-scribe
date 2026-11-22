@@ -1,15 +1,29 @@
-"""Diagnostic tool for scribe audio setup.
+"""Diagnostics for the capture setup.
 
-Checks BlackHole, Aggregate/Multi-Output devices, and audio routing.
+The checks no longer require a specific Aggregate Device. scribe opens the
+microphone and the loopback as two separate streams, so the only things that
+must be true are:
+
+1. A loopback device exists (BlackHole).
+2. System output is routed so that the loopback receives a copy of the audio.
+3. The loopback actually passes audio.
+4. Some microphone is available.
+
+The routing check is the one that matters: a mis-routed output produces a
+recording containing only your own voice, which is how a real 36-minute
+interview was captured with the other side entirely missing.
 """
 
+from __future__ import annotations
+
 import subprocess
+import threading
+import time
+
 import numpy as np
-import sounddevice as sd
 
-from .audio import get_system_audio
+from .capture import find_device, get_system_audio, list_devices
 
-# ANSI colors
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -20,136 +34,113 @@ PASS = f"{GREEN}✓ PASS{RESET}"
 FAIL = f"{RED}✗ FAIL{RESET}"
 WARN = f"{YELLOW}⚠ WARN{RESET}"
 
-
-def _find_device(name: str) -> dict | None:
-    """Find input device by partial name match (case-insensitive)."""
-    devices = sd.query_devices()
-    for i, d in enumerate(devices):
-        if name.lower() in d["name"].lower() and d["max_input_channels"] > 0:
-            return {"id": i, **d}
-    return None
+LOOPBACK_NAME = "BlackHole"
+ROUTING_HINTS = ("blackhole", "meeting capture", "multi-output")
 
 
-def _find_output_device(name: str) -> dict | None:
-    """Find output device by partial name match."""
-    devices = sd.query_devices()
-    for i, d in enumerate(devices):
-        if name.lower() in d["name"].lower() and d["max_output_channels"] > 0:
-            return {"id": i, **d}
-    return None
+def _test_loopback(device_name: str, seconds: float = 2.0) -> float:
+    """Play a system sound and measure what the loopback receives."""
+    import sounddevice as sd
+
+    def play():
+        time.sleep(0.3)
+        subprocess.run(
+            ["afplay", "/System/Library/Sounds/Ping.aiff"], capture_output=True
+        )
+
+    thread = threading.Thread(target=play, daemon=True)
+    thread.start()
+    audio = sd.rec(
+        int(seconds * 48000), samplerate=48000, channels=2,
+        device=device_name, dtype="float32",
+    )
+    sd.wait()
+    thread.join(timeout=2)
+    return float(np.sqrt(np.mean(audio**2)))
 
 
-def _test_blackhole_loopback() -> bool:
-    """Test BlackHole by playing a system sound and reading it back."""
-    try:
-        import threading
-        import time
+def run_doctor() -> None:
+    print(f"\n{BOLD}scribe doctor{RESET}\n")
+    failures = 0
 
-        def play():
-            time.sleep(0.3)
-            subprocess.run(["afplay", "/System/Library/Sounds/Ping.aiff"],
-                           capture_output=True)
-
-        t = threading.Thread(target=play)
-        t.start()
-        audio = sd.rec(int(2 * 48000), samplerate=48000, channels=2,
-                       device="BlackHole 2ch", dtype="float32")
-        sd.wait()
-        t.join()
-        rms = float(np.sqrt(np.mean(audio ** 2)))
-        return rms > 0.0005
-    except Exception:
-        return False
-
-
-def run_doctor():
-    """Run all diagnostic checks."""
-    print(f"\n{BOLD}scribe doctor — Audio Diagnostic{RESET}\n")
-    all_ok = True
-
-    # 0. Current system audio devices
-    sys_audio = get_system_audio()
-    out_name = sys_audio["output"]["name"] if sys_audio["output"] else "None"
-    in_name = sys_audio["input"]["name"] if sys_audio["input"] else "None"
-    print(f"{BOLD}System Audio{RESET}")
-    print(f"  🔊 Output: {BOLD}{out_name}{RESET}")
-    print(f"  🎤 Input:  {BOLD}{in_name}{RESET}")
-
-    # Check if output is a Meeting Capture device
-    if "meeting capture" in out_name.lower():
-        print(f"  {PASS}  Output is routed through Meeting Capture")
+    # 1. Loopback device -----------------------------------------------------
+    print(f"{BOLD}[1/4] Loopback device{RESET}")
+    loopback = find_device(LOOPBACK_NAME, "input")
+    if loopback:
+        print(f"  {PASS}  {loopback.name} (device {loopback.id}, "
+              f"{loopback.max_input_channels} in)")
     else:
-        print(f"  {WARN}  Output is NOT Meeting Capture — meeting audio won't be captured")
-        print(f"         → Set Sound Output to Meeting Capture")
+        print(f"  {FAIL}  No '{LOOPBACK_NAME}' input device found")
+        print("         Install it: brew install blackhole-2ch")
+        failures += 1
 
-    print()
-
-    # 1. BlackHole driver
-    print(f"{BOLD}[1/4] BlackHole 2ch{RESET}")
-    bh = _find_device("BlackHole 2ch")
-    if bh:
-        print(f"  {PASS}  Found: device {bh['id']}, "
-              f"{bh['max_input_channels']}in/{bh['max_output_channels']}out")
+    # 2. Output routing ------------------------------------------------------
+    print(f"\n{BOLD}[2/4] System output routing{RESET}")
+    output = get_system_audio()["output"]
+    out_name = output.name if output else "None"
+    print(f"  Output: {BOLD}{out_name}{RESET}")
+    routed = bool(output) and any(h in out_name.lower() for h in ROUTING_HINTS)
+    if routed:
+        print(f"  {PASS}  Output reaches the loopback")
     else:
-        print(f"  {FAIL}  Not found — install: brew install blackhole-2ch")
-        all_ok = False
+        print(f"  {WARN}  Output does not reach the loopback — meeting audio")
+        print("         will not be captured.")
+        print("         Create a Multi-Output Device containing your headset and")
+        print("         BlackHole, then select it as the system output.")
 
-    # 2. BlackHole loopback
-    print(f"\n{BOLD}[2/4] BlackHole loopback test{RESET}")
-    if bh:
-        ok = _test_blackhole_loopback()
-        if ok:
-            print(f"  {PASS}  BlackHole passes audio")
-        else:
-            print(f"  {WARN}  No audio detected — make sure system output includes BlackHole")
-            print(f"         Set output to Meeting Capture or BlackHole 2ch, then re-run")
+    print(f"\n  {BOLD}Also check inside your meeting app:{RESET}")
+    print("    Zoom/Teams Speaker must be 'Same as System', not your headset.")
+    print("    Selecting the headset there bypasses the loopback entirely and")
+    print("    is the most common cause of a one-sided transcript.")
+
+    # 3. Loopback carries audio ---------------------------------------------
+    print(f"\n{BOLD}[3/4] Loopback passes audio{RESET}")
+    if loopback:
+        try:
+            rms = _test_loopback(loopback.name)
+            if rms > 0.0005:
+                print(f"  {PASS}  Audio detected (RMS {rms:.5f})")
+            else:
+                print(f"  {WARN}  Silence (RMS {rms:.5f})")
+                print("         Fix the routing above, then re-run.")
+        except Exception as exc:
+            print(f"  {WARN}  Could not test: {exc}")
     else:
-        print(f"  {FAIL}  Skipped (BlackHole not found)")
-        all_ok = False
+        print(f"  {FAIL}  Skipped — no loopback device")
+        failures += 1
 
-    # 3. Meeting Input (Aggregate Device)
-    print(f"\n{BOLD}[3/4] Meeting Input (Aggregate Device){RESET}")
-    mi = _find_device("Meeting Input")
-    if mi:
-        ch = mi["max_input_channels"]
-        print(f"  {PASS}  Found: device {mi['id']}, {ch} channels")
-        if ch >= 3:
-            print(f"  {PASS}  Channel layout: mic(0) + meeting(1,2)")
-        elif ch == 2:
-            print(f"  {WARN}  Only 2 channels — mic and meeting may overlap")
-        else:
-            print(f"  {WARN}  Only {ch} channel — speaker detection won't work")
+    # 4. Microphone ----------------------------------------------------------
+    print(f"\n{BOLD}[4/4] Microphone{RESET}")
+    default_in = get_system_audio()["input"]
+    if default_in:
+        print(f"  {PASS}  Default input: {default_in.name}")
     else:
-        print(f"  {FAIL}  Not found — create in Audio MIDI Setup:")
-        print(f"         1. Click + → Create Aggregate Device")
-        print(f"         2. Tick your mic + BlackHole 2ch")
-        print(f"         3. Rename to 'Meeting Input'")
-        all_ok = False
+        print(f"  {WARN}  No default input device — speaker labelling will be off")
 
-    # 4. Meeting Capture (Multi-Output Device)
-    print(f"\n{BOLD}[4/4] Meeting Capture (Multi-Output Device){RESET}")
-    mc = _find_output_device("Meeting Capture")
-    if mc:
-        print(f"  {PASS}  Found: device {mc['id']}")
+    others = [
+        d for d in list_devices("input")
+        if LOOPBACK_NAME.lower() not in d.name.lower()
+        and (default_in is None or d.id != default_in.id)
+    ]
+    if others:
+        print("  Other inputs available for --mic:")
+        for d in others[:8]:
+            print(f"    - {d.name}")
+
+    # Summary ----------------------------------------------------------------
+    print(f"\n{BOLD}{'=' * 56}{RESET}")
+    if failures == 0 and routed:
+        print(f"{GREEN}{BOLD}Ready to record.{RESET}")
+    elif failures == 0:
+        print(f"{YELLOW}{BOLD}Usable, but meeting audio is not routed yet.{RESET}")
     else:
-        print(f"  {FAIL}  Not found — create in Audio MIDI Setup:")
-        print(f"         1. Click + → Create Multi-Output Device")
-        print(f"         2. Tick your speakers/headset + BlackHole 2ch")
-        print(f"         3. Rename to 'Meeting Capture'")
-        all_ok = False
+        print(f"{RED}{BOLD}Setup incomplete — see above.{RESET}")
 
-    # Summary
-    print(f"\n{BOLD}{'=' * 50}{RESET}")
-    if all_ok:
-        print(f"{GREEN}{BOLD}All checks passed!{RESET}")
-    else:
-        print(f"{RED}{BOLD}Some checks failed — see above for fixes.{RESET}")
-
-    # Usage hint
-    print(f"\n{BOLD}Usage:{RESET}")
-    print(f"  1. Set Sound Output → Meeting Capture")
-    print(f"  2. scribe record --device 'Meeting Input'")
-    print(f"\n{BOLD}Troubleshooting:{RESET}")
-    print(f"  BlackHole broken:  brew reinstall blackhole-2ch && restart")
-    print(f"  Audio daemon stuck: sudo killall coreaudiod")
+    print(f"\n{BOLD}Usage{RESET}")
+    print("  scribe record                       # system default mic + BlackHole")
+    print("  scribe record --mic 'Plantronics'   # pick a microphone explicitly")
+    print("  scribe record --no-mic              # meeting audio only")
+    print(f"\n{BOLD}If audio behaves strangely after reconnecting a headset{RESET}")
+    print("  sudo killall coreaudiod             # restarts automatically")
+    print("  brew reinstall blackhole-2ch        # then restart macOS")
     print()

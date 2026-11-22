@@ -1,292 +1,225 @@
 # Scribe — AI Meeting Transcriber
 
-Scribe is an AI-powered meeting transcription tool that runs entirely on your local machine. It captures live audio from any meeting platform including **Microsoft Teams**, **Zoom**, **Slack Huddle**, **Google Meet** and more, transcribes speech in real-time using OpenAI's Whisper model, and automatically identifies who's speaking. No cloud services, no API costs, no data leaving your laptop. Everything stays private and secure.
+Scribe transcribes meetings on your own machine. It captures audio from any meeting platform — Microsoft Teams, Zoom, Slack Huddle, Google Meet — transcribes it locally with Whisper, and labels who was speaking.
 
-Generate near real-time AI summaries during or after meetings with key discussion points, decisions, and action items using [Auggie CLI](https://www.augmentcode.com/product/CLI) by [Augment Code](https://www.augmentcode.com).
-
-## Technology
-
-| Component | Technology | Details |
-|-----------|-----------|---------|
-| **Speech-to-Text** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | CTranslate2 re-implementation of OpenAI's [Whisper](https://github.com/openai/whisper) — 4x faster inference on Apple Silicon |
-| **Models** | [OpenAI Whisper](https://huggingface.co/Systran) (via Hugging Face) | Open-source (MIT license), free to download, runs 100% locally |
-| **Audio Capture** | [sounddevice](https://python-sounddevice.readthedocs.io/) + [BlackHole](https://existential.audio/blackhole/) | PortAudio bindings for Python + macOS virtual audio loopback |
-| **Speaker Detection** | Channel-based energy analysis | Physical mic/meeting separation — no ML diarization needed |
-| **Summarization** | [Auggie CLI](https://www.augmentcode.com/product/CLI) (optional) | AI-powered summary via Augment Code |
-
-### About Hugging Face
-
-The Whisper models are hosted on [Hugging Face Hub](https://huggingface.co/Systran) and downloaded automatically on first use:
-
-- **No account required** — models download without authentication
-- **No API key needed** — everything runs locally after download
-- **No cost** — all models are open-source (MIT license)
-- **No data sent to cloud** — transcription happens entirely on your machine
-- **One-time download** — models are cached in `~/.cache/huggingface/`
-
-> The `HF_TOKEN` warning you may see is optional — it only speeds up downloads slightly. You can safely ignore it.
+Nothing leaves your laptop: no account, no API key, no network calls after the model is downloaded once.
 
 ## How it works
 
 ```
-Meeting audio (Teams/Zoom/Slack Huddle etc.)
+Meeting audio (Teams / Zoom / Slack Huddle)
     ↓
-Multi-Output Device → you hear + BlackHole captures
+Multi-Output Device → you hear it + BlackHole gets a copy
     ↓
-Aggregate Device → combines BlackHole (meeting) + your mic
+scribe opens TWO independent input streams
+    • your microphone      → "You"
+    • BlackHole (loopback) → "Meeting"
     ↓
-scribe captures from Aggregate Device
+aligned on the wall clock, mixed, transcribed locally
     ↓
-faster-whisper transcribes locally (30s overlapping windows)
+per-channel energy decides who spoke
     ↓
-Channel energy detection → labels "You" vs "Meeting"
-    ↓
-raw/transcript_YYYY-MM-DD_HHMM.md (appended in real-time)
+raw/transcript_YYYY-MM-DD_HHMM.md  (+ .json sidecar)
 ```
 
-Output looks like:
+Output:
 
 ```markdown
-**You**: Hello, how are you? So today I think you will teach me how to pronounce it, right?
-**Meeting**: Hello lovely students and welcome to your pronunciation training session.
-**You**: Thank you very much. So you will teach me 100 everyday words.
+**You**: How is the migration going?
+**Meeting**: It is going well — we finished the first phase last night.
 ```
+
+Two separate streams rather than one Aggregate Device is deliberate. An aggregate breaks when you unplug a headset: the missing member becomes "Offline Device", the channel map shifts, and recordings corrupt silently. With separate streams, unplugging a headset costs you speaker labels, not the meeting.
+
+| Component | Technology |
+|-----------|-----------|
+| Speech-to-text | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2) |
+| Models | [Whisper](https://huggingface.co/Systran), MIT licensed, cached in `~/.cache/huggingface/` |
+| Audio capture | [sounddevice](https://python-sounddevice.readthedocs.io/) + [BlackHole](https://existential.audio/blackhole/) |
+| Speaker detection | Calibrated per-channel energy — no ML diarization |
 
 ## Prerequisites
 
-- **macOS** with Apple Silicon (M1/M2/M3/M4)
-- **BlackHole 2ch** installed ([download](https://existential.audio/blackhole/))
-- **Python 3.11+**
-- **uv** package manager ([install](https://docs.astral.sh/uv/getting-started/installation/))
-- **PortAudio** (for sounddevice): `brew install portaudio`
+- macOS with Apple Silicon (M1/M2/M3/M4)
+- BlackHole 2ch — `brew install blackhole-2ch`
+- PortAudio — `brew install portaudio`
+- Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
-## One-time macOS Audio Setup
+## One-time setup
 
-Open **Audio MIDI Setup** (`Cmd + Space` → type "Audio MIDI Setup").
+You need **one** Multi-Output Device, so you can hear the meeting while BlackHole receives a copy. No Aggregate Device, and no second set of devices per headset.
 
-There are two setup modes. Choose the one that fits your needs:
-
-### Option A: Full Setup (with speaker detection)
-
-This captures both meeting audio AND your microphone, labeling who said what.
-
-#### 1. Create Multi-Output Device (output routing)
-
-This lets you **hear the meeting AND route audio to BlackHole** simultaneously.
+Open **Audio MIDI Setup** (`Cmd + Space` → "Audio MIDI Setup"):
 
 1. Click **+** → **Create Multi-Output Device**
-2. Tick ✅ your headset or speakers (e.g. AirPods, Jabra, any USB headset)
-3. Tick ✅ **BlackHole 2ch**
-4. Make sure your **headset is listed FIRST** (drag to reorder)
-5. Right-click → rename to **"Meeting Capture"**
+2. Tick your headset *and* every other device you listen through (speakers, a second headset)
+3. Tick **BlackHole 2ch**
+4. Set **Primary Device** to **BlackHole 2ch** — it is always present, so the group survives a Bluetooth headset dropping out
+5. Tick **Drift Correction** on every row *except* BlackHole
+6. Right-click → rename to **"Meeting Capture"**
 
-#### 2. Create Aggregate Device (input capture)
+Before each meeting, set **Sound Output → Meeting Capture**. Afterwards, set it back.
 
-This combines your mic + meeting audio into one input with separate channels.
+A device can only be ticked while it is connected, so add each new headset once. The group skips members that are absent, which is why one device serves every headset.
 
-1. Click **+** → **Create Aggregate Device**
-2. Tick ✅ your microphone (e.g. AirPods, USB headset, or MacBook Air Microphone)
-3. Tick ✅ **BlackHole 2ch**
-4. Right-click → rename to **"Meeting Input"**
+### The setting people get wrong
 
-This creates a 3-channel device:
-- **Channel 0** = your mic
-- **Channels 1-2** = BlackHole (meeting audio)
+**In Zoom/Teams, set Speaker to "Same as System" — not your headset.**
 
-#### 3. Before each meeting
+Choosing your headset inside the meeting app bypasses the Multi-Output Device entirely. BlackHole then receives nothing and you get a transcript containing only your own voice. This is by far the most common cause of a one-sided recording. Microphone can stay set to your headset.
 
-- Sound **output** → **Meeting Capture** (Multi-Output Device)
-- The tool records from **Meeting Input** (Aggregate Device) automatically
+scribe warns about this at runtime as soon as it sees your speech with a silent loopback. `scribe doctor` checks the rest.
 
-#### 4. After the meeting
-
-- Switch sound output back to your headset or speakers
-
-### Option B: Simple Setup (meeting audio only, no speaker detection)
-
-If you don't need "You" vs "Meeting" labels, or want a more reliable setup that doesn't depend on a specific headset/mic:
-
-#### 1. Create Multi-Output Device (same as Option A)
-
-Follow steps above to create **"Meeting Capture"**.
-
-#### 2. Before each meeting
-
-- Sound **output** → **Meeting Capture**
-- Run with `--no-speakers` flag:
+## Quick start
 
 ```bash
-scribe record --device "BlackHole" --no-speakers
-```
-
-This captures only meeting audio (what others say). Your voice won't be recorded but the setup is simpler and doesn't break when you switch headsets.
-
-> **Note on headset switching (Option A):** macOS Aggregate and Multi-Output devices can break when you disconnect/reconnect a headset (USB unplug, Bluetooth drop). If audio stops working, open Audio MIDI Setup and re-add your headset to the devices. Option B avoids this issue entirely.
-
-## Quick Start
-
-```bash
-cd ai-meeting-scribe
-
-# Install
 uv sync
 
-# Check audio setup
-uv run scribe doctor
-
-# List audio devices
-uv run scribe devices
-
-# Start recording with speaker detection
-uv run scribe record --device "Meeting Input"
-
-# Ctrl+C to stop — transcript saved to raw/
+scribe doctor      # check the audio setup
+scribe devices     # list inputs and outputs
+scribe record      # Ctrl+C to stop
 ```
 
 ## Usage
 
 ```bash
-# List available input devices
-scribe devices
+# Defaults: system default microphone + BlackHole
+scribe record
 
-# Record with speaker detection (recommended)
-scribe record --device "Meeting Input"
+# Pick a microphone explicitly (partial name match)
+scribe record --mic "Plantronics"
 
-# Custom output directory
-scribe record --device "Meeting Input" --raw ~/Desktop/transcripts
+# Meeting audio only — no speaker labels, nothing to break on reconnect
+scribe record --no-mic
 
-# Better quality model (default: small)
-scribe record --device "Meeting Input" --model medium
+# Your microphone only
+scribe record --no-system
 
-# Non-English meeting
-scribe record --device "Meeting Input" --language tr
+# Model and language
+scribe record --model medium
+scribe record --language tr
+scribe record --language auto      # detect once, then pin
 
-# Disable speaker detection (plain text mode)
-scribe record --device "Meeting Input" --no-speakers
+# Output
+scribe record --raw ~/Desktop/transcripts --title "Sprint planning"
 
-# Debug: see channel energy levels for tuning
-scribe record --device "Meeting Input" --debug
+# Overlapping window (default: 30s window, 15s step)
+scribe record --window 45 --step 20
 
-# Adjust overlapping window (default: 30s window, 15s step)
-scribe record --device "Meeting Input" --window 30 --step 15
+# Speaker-detection tuning
+scribe record --mic-margin 12      # dB above the mic's noise floor = your speech
+scribe record --debug              # per-segment channel energy
+scribe record --no-speakers        # disable labelling
 
-# If your mic is on a different channel
-scribe record --device "Meeting Input" --mic-channel 0
+# Keep low-confidence filler segments ("You", "Thank you.")
+scribe record --keep-filler
 ```
 
-## Summarize Transcripts
+### Output files
 
-After a meeting, use the `summarize` command to generate an AI summary via [Auggie CLI](https://www.augmentcode.com/product/CLI).
+Each recording produces two files side by side:
 
-### Prerequisites
+- `transcript_<date>_<time>.md` — YAML frontmatter plus speaker-labelled turns. The file to read; indexes cleanly in Obsidian.
+- `transcript_<date>_<time>.json` — the same content as structured segments with timings, plus metadata.
 
-```bash
-npm install -g @augmentcode/auggie
-```
+A recording started in the same minute as an existing one gets a `-2` suffix rather than overwriting it.
 
-### Usage
-
-```bash
-# Summarize a transcript
-scribe summarize raw/transcript_2026-05-05_2141.md
-
-# Save summary to file
-scribe summarize raw/transcript_2026-05-05_2141.md -o summary.md
-
-# Stream output in real-time
-scribe summarize raw/transcript_2026-05-05_2141.md --stream
-
-# Custom prompt
-scribe summarize raw/transcript_2026-05-05_2141.md -p "List only action items"
-```
-
-The default summary includes: **Summary**, **Key Discussion Points**, **Decisions Made**, **Action Items**, and **Notable Quotes**.
-
-## Install globally (run from anywhere)
+## Install globally
 
 ```bash
-cd ai-meeting-scribe
 uv tool install .
-
-# Now run from any directory:
-scribe record --device "Meeting Input" --raw ~/Desktop/transcripts
-scribe summarize ~/Desktop/transcripts/transcript_2026-05-05_2141.md
+scribe record --raw ~/Desktop/transcripts
 ```
 
-## Environment Variables
+## Environment variables
 
 ```bash
-# Add to ~/.zshrc for persistent config
-export SCRIBE_RAW_DIR=~/Desktop/raw
+export SCRIBE_RAW_DIR=~/Desktop/raw   # default output directory
 ```
 
-## Whisper Models
+## Whisper models
 
-Models are downloaded from [Hugging Face](https://huggingface.co/Systran) on first use and cached locally. Change with `--model`:
+| Model | Download | Speed vs realtime | Good for |
+|-------|----------|-------------------|----------|
+| `tiny` | ~40MB | 37x | Smoke tests only |
+| `base` | ~150MB | not measured | Fast, lower accuracy |
+| `small` | ~500MB | 8x | **Recommended (default)** |
+| `large-v3-turbo` | ~1.6GB | 2.4x | Best quality that still keeps up |
+| `medium` / `large-v3` | ~1.5GB / ~3GB | not measured | Maximum quality |
 
-| Model | Download | Disk Cache | Speed | Quality | Good for |
-|-------|----------|-----------|-------|---------|----------|
-| `tiny` | ~40MB | `~/.cache/huggingface/` | ★★★★★ | ★★ | Quick test |
-| `base` | ~150MB | `~/.cache/huggingface/` | ★★★★ | ★★★ | Fast, lower accuracy |
-| `small` | ~500MB | `~/.cache/huggingface/` | ★★★ | ★★★★ | **Recommended (default)** |
-| `medium` | ~1.5GB | `~/.cache/huggingface/` | ★★ | ★★★★★ | Best local quality |
-| `large-v3` | ~3GB | `~/.cache/huggingface/` | ★ | ★★★★★ | Maximum quality |
+Measured on Apple Silicon with `int8` on an 11-second clip. Even `tiny` handles clean audio reasonably; quality problems are far more often a wrong `--language` than a small model.
 
-> All models use [CTranslate2](https://github.com/OpenNMT/CTranslate2) for optimised inference on Apple Silicon (M1/M2/M3/M4).
+If transcription cannot keep up, scribe reports how many seconds of audio were lost — drop to a smaller model if you see that.
 
-## How Speaker Detection Works
+## How speaker detection works
 
-Instead of ML-based diarization, we use **physical channel separation**:
+Your microphone carries only your voice; BlackHole carries only the meeting. For each transcribed segment, scribe compares how far each channel rises above **its own measured noise floor**.
 
-1. Your mic (channel 0) only picks up **your voice**
-2. BlackHole (channels 1-2) only carries **meeting audio**
-3. For each transcribed word, we check **which channel has energy**
-4. Words are merged into sentences per speaker
+A fixed threshold does not work. A near-field headset mic is simply louder than post-mixer loopback audio, so comparing raw levels attributes everything to you. Measuring each channel against its own floor also handles the opposite case, where a built-in mic picks up the laptop speakers — that bleed is attenuated, so it stays below the loopback's.
 
-This is faster and more accurate than ML diarization because it uses physical separation rather than audio similarity guessing.
+Decisions are made per segment, not per word, so a sentence is never split between speakers.
 
 ## Troubleshooting
 
+### Transcript contains only my voice
+Your meeting app is bypassing the Multi-Output Device. Set **Speaker → "Same as System"** in Zoom/Teams.
+
+### Everything labelled "You", or everything "Meeting"
+Run with `--debug` to see per-segment energy and which rule fired. Raise `--mic-margin` if ambient noise is being treated as your speech; lower it if your speech is being missed.
+
+### Confident nonsense in the transcript
+Whisper forced into the wrong language invents fluent text rather than failing. Set `--language` correctly, or use `--language auto`.
+
 ### "No input devices found"
-- Install PortAudio: `brew install portaudio`
-- Reinstall sounddevice: `uv pip install --force-reinstall sounddevice`
+```bash
+brew install portaudio
+uv pip install --force-reinstall sounddevice
+```
 
-### BlackHole not showing up
-- Download from https://existential.audio/blackhole/
-- After install, restart Audio MIDI Setup
-
-### No audio captured / empty transcript
-- Make sure **Meeting Capture** (Multi-Output Device) is selected as sound output
-- Check that your meeting app is playing audio
-- Test: play music → run `scribe record --device "Meeting Input"`
-
-### Everything labeled as "Meeting"
-- Your mic energy may be too low — run with `--debug` to see energy levels
-- If mic energy is below 0.001 when you speak, the threshold may need adjusting
-
-### Poor transcription quality
-- Try a larger model: `--model medium`
-- Make sure the meeting audio is clear (not too quiet)
+### BlackHole missing, or audio broken after reconnecting a headset
+```bash
+sudo killall coreaudiod          # restarts automatically
+brew reinstall blackhole-2ch     # then restart macOS
+```
 
 ### Sentences breaking mid-word
-- Increase window size: `--window 45 --step 20`
-
-### Headset disconnected/reconnected and audio stopped working
-This is a known macOS limitation with Aggregate and Multi-Output devices.
-1. Run `scribe doctor` to see what's broken
-2. Open **Audio MIDI Setup**
-3. Click on **Meeting Capture** and **Meeting Input**
-4. Uncheck and re-check your headset/mic
-5. If that doesn't work, delete the devices and recreate them
-6. If BlackHole stops working: `brew reinstall blackhole-2ch` then restart macOS
-7. If audio daemon is stuck: `sudo killall coreaudiod` (restarts automatically)
-
-To avoid this issue, use **Option B** (simple setup) which only requires BlackHole.
+Increase the window: `--window 45 --step 20`.
 
 ### Quick diagnostic
-
 ```bash
 scribe doctor
 ```
 
-This checks BlackHole, aggregate devices, and audio routing — and tells you exactly what to fix.
+## Development
+
+```bash
+uv sync --group dev
+uv run pytest
+```
+
+Layout:
+
+| Module | Role |
+|--------|------|
+| `capture.py` | Two input streams, wall-clock aligned ring buffers |
+| `transcriber.py` | faster-whisper wrapper, confidence filtering, loop collapsing |
+| `speakers.py` | Calibrated per-channel speaker attribution |
+| `dedup.py` | Overlap removal between consecutive windows |
+| `writer.py` | Markdown + JSON sidecar output |
+| `session.py` | Recording engine — owns the loop, publishes events |
+| `main.py` | CLI, rendering the engine's event stream |
+| `doctor.py` | Audio setup diagnostics |
+
+`session.py` is the headless core: it prints nothing and publishes `state`, `segments`, `levels`, `notice`, `session` and `summary` events. The CLI is one consumer of that stream.
+
+## Privacy
+
+Transcripts are verbatim records of conversations, often including things people did not expect to be written down.
+
+- Recording does not stop when the meeting does. Press Ctrl+C when the call ends.
+- If your output directory sits in a synced folder (iCloud, Dropbox, Obsidian Sync), transcripts leave your machine.
+- Recording other people may require their consent where you are.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
