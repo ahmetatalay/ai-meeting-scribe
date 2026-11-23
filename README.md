@@ -191,6 +191,12 @@ A fixed threshold does not work. A near-field headset mic is simply louder than 
 
 Decisions are made per segment, not per word, so a sentence is never split between speakers.
 
+## Why text sometimes changes as you watch
+
+Consecutive windows overlap, so the audio at a window's edge gets transcribed twice — and the second pass has the following context the first one lacked. "The same purpose" becomes "the same problem when two guests book". scribe replaces the earlier guess rather than appending around it, so a few seconds of recent text can change shortly after it appears. The saved transcript always holds the settled version.
+
+Replacement only happens when a window re-transcribes the previous batch in full; otherwise the earlier text is left alone.
+
 ## Troubleshooting
 
 ### Transcript contains only my voice

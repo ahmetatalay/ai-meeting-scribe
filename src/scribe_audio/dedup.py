@@ -139,6 +139,92 @@ def slice_segments(segments: list[dict], word_index: int) -> list[dict]:
     return out
 
 
+# How far from the start of the previous batch an alignment may begin, and how
+# far short of its end it may stop, for that batch to count as fully covered.
+_BATCH_SLACK = 1
+
+# Where in the *current* window the batch's re-transcription may begin. Unlike
+# find_new_index this is strict: the batch's audio starts exactly at the current
+# window's start, so any match beginning later would sweep words belonging to
+# earlier, already-written audio into the replacement and duplicate them.
+_TAIL_HEAD_TOLERANCE = 0
+
+
+def align_tail(batch_words: list[str], curr_words: list[str]) -> int:
+    """Words of ``curr_words`` that re-transcribe *all* of ``batch_words``.
+
+    Returns 0 unless the alignment both starts at the beginning of the batch and
+    reaches its end. That condition is what makes replacing the batch safe: a
+    partial match would delete the part of the batch the current window does not
+    cover, and an alignment reaching further back than the batch would duplicate
+    text written before it.
+    """
+    if not batch_words or not curr_words:
+        return 0
+
+    prev_norm = _normalise_all(batch_words)
+    curr_norm = _normalise_all(curr_words)
+
+    sm = SequenceMatcher(None, prev_norm, curr_norm, autojunk=False)
+    blocks = [b for b in sm.get_matching_blocks() if b.size > 0]
+    anchor_idx = next(
+        (i for i, b in enumerate(blocks) if b.b <= _TAIL_HEAD_TOLERANCE), None
+    )
+    if anchor_idx is None:
+        return 0
+
+    anchor = blocks[anchor_idx]
+    if anchor.a > _BATCH_SLACK:
+        return 0  # the batch's opening words are not covered
+
+    end_curr = anchor.b + anchor.size
+    end_prev = anchor.a + anchor.size
+    matched = anchor.size
+
+    for block in blocks[anchor_idx + 1:]:
+        gap = block.b - end_curr
+        if gap < 0:
+            continue
+        if gap > max(_MIN_GAP_TOLERANCE, matched // 2):
+            break
+        end_curr = block.b + block.size
+        end_prev = block.a + block.size
+        matched += block.size
+
+    if end_prev < len(batch_words) - _BATCH_SLACK:
+        return 0  # the batch's closing words are not covered
+    return min(end_curr, len(curr_words))
+
+
+def head_segments(segments: list[dict], word_index: int) -> list[dict]:
+    """The first ``word_index`` words of a list of segments.
+
+    The complement of :func:`slice_segments`: together they split a window into
+    the part that re-transcribes the previous window's audio and the part that
+    is genuinely new.
+    """
+    if word_index <= 0:
+        return []
+
+    remaining = word_index
+    out: list[dict] = []
+    for seg in segments:
+        words = seg.get("text", "").split()
+        if not words:
+            continue
+        if remaining >= len(words):
+            out.append(dict(seg))
+            remaining -= len(words)
+        else:
+            trimmed = dict(seg)
+            trimmed["text"] = " ".join(words[:remaining])
+            out.append(trimmed)
+            remaining = 0
+        if remaining == 0:
+            break
+    return out
+
+
 def extract_new_text(prev_text: str, curr_text: str, min_overlap_words: int = 3) -> str:
     """String convenience wrapper around :func:`find_new_index`."""
     if not prev_text:

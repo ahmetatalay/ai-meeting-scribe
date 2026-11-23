@@ -60,6 +60,15 @@ class TranscriptWriter:
         self._segments: list[dict] = []
         self._turn_count = 0
 
+        # State captured before the most recent batch was written, so that
+        # batch can be replaced when the next window re-transcribes the same
+        # audio more accurately. Only the last batch is revisable: the overlap
+        # only ever spans two consecutive windows.
+        self._batch_offset: int | None = None
+        self._batch_prev_speaker: str | None = None
+        self._batch_prev_turns = 0
+        self._batch_segment_count = 0
+
     # ------------------------------------------------------------------ paths
 
     @property
@@ -110,6 +119,13 @@ class TranscriptWriter:
             return
 
         path = self._ensure_file()
+
+        # Remember where this batch begins so it can be revised later.
+        self._batch_offset = path.stat().st_size
+        self._batch_prev_speaker = self._last_speaker
+        self._batch_prev_turns = self._turn_count
+        self._batch_segment_count = len(usable)
+
         lines = []
         for seg in usable:
             speaker = seg["speaker"]
@@ -136,6 +152,48 @@ class TranscriptWriter:
             fh.write("\n".join(lines) + "\n")
 
         self._write_sidecar()
+
+    def revise_last_batch(self, segments: list[dict]) -> bool:
+        """Replace the most recently written batch with a better transcription.
+
+        Consecutive windows overlap, so the audio behind the last batch is
+        transcribed a second time by the next window — with the following
+        context that the first pass lacked. That second reading is usually the
+        better one ("the same purpose" becoming "the same problem"), so rather
+        than trying to append around the first guess, the first guess is
+        replaced.
+
+        Returns False when there is nothing revisable, in which case the caller
+        should append instead.
+        """
+        if self._path is None or self._batch_offset is None:
+            return False
+
+        # Roll the file and the derived state back to before that batch.
+        with open(self._path, "r+b") as fh:
+            fh.truncate(self._batch_offset)
+
+        if self._batch_segment_count:
+            del self._segments[-self._batch_segment_count:]
+        self._last_speaker = self._batch_prev_speaker
+        self._turn_count = self._batch_prev_turns
+        self._batch_offset = None
+        self._batch_segment_count = 0
+
+        self.append_segments(segments)
+        return True
+
+    @property
+    def has_revisable_batch(self) -> bool:
+        return self._batch_offset is not None
+
+    def seal(self) -> None:
+        """Mark the last batch final, so it will not be revised.
+
+        Used when speech stops: a later window cannot overlap it any more.
+        """
+        self._batch_offset = None
+        self._batch_segment_count = 0
 
     def append_text(self, text: str) -> None:
         """Append unattributed text (speaker detection disabled)."""

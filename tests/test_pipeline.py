@@ -7,11 +7,25 @@ overlapping windows that Whisper re-words slightly.
 """
 
 import json
+import re
 
 from fakes import build_session, make_window
 
 YOU = "You"
 MEETING = "Meeting"
+
+
+def spoken(body: str) -> str:
+    """The transcript's words, with markdown layout normalised away.
+
+    A revision and the text appended after it land on separate lines, which
+    markdown renders as one paragraph — so assertions are about content, not
+    line breaks.
+    """
+    text = re.sub(r"\A---\n.*?\n---\n", "", body, flags=re.S)
+    text = re.sub(r"^#.*$", "", text, flags=re.M)
+    text = re.sub(r"\*\*[^*]+\*\*:", "", text)
+    return " ".join(text.split())
 
 
 def run(tmp_path, script, speakers, **cfg):
@@ -84,6 +98,75 @@ class TestOverlapRemoval:
         body, _ = run(tmp_path, script, [YOU] * 3)
         assert "something was said" in body
         assert "something else was said" in body
+
+
+class TestTailRevision:
+    """A window's last words are guessed without following context; the next
+    window has it. Observed live: "Airbnb has the same purpose." became
+    "...the same problem when two guests book..." on the second pass."""
+
+    def test_a_wrong_guess_at_the_boundary_is_replaced(self, tmp_path):
+        script = [
+            "Airbnb has the same purpose",
+            "Airbnb has the same problem when two guests book",
+        ]
+        body, _ = run(tmp_path, script, [MEETING] * 2)
+
+        assert "purpose" not in body
+        assert "Airbnb has the same problem when two guests book" in spoken(body)
+
+    def test_the_corrected_text_appears_exactly_once(self, tmp_path):
+        script = [
+            "the cache layer is returning stale keys",
+            "the cache layer is returning stale keys again after the deploy",
+        ]
+        body, _ = run(tmp_path, script, [YOU] * 2)
+        assert spoken(body).count("returning stale keys") == 1
+        assert "again after the deploy" in spoken(body)
+
+    def test_a_truncated_final_word_is_completed(self, tmp_path):
+        """The window boundary cut a word in half on the first pass."""
+        script = [
+            "we will discuss the migra",
+            "we will discuss the migration next week",
+        ]
+        body, _ = run(tmp_path, script, [YOU] * 2)
+
+        assert "migra\n" not in body
+        assert "we will discuss the migration next week" in spoken(body)
+
+    def test_revision_may_change_the_speaker(self, tmp_path):
+        script = ["who said this", "who said this was fine"]
+        body, _ = run(tmp_path, script, [YOU, MEETING])
+        # Whoever it ends up attributed to, it must appear once under one label.
+        assert spoken(body).count("who said this") == 1
+
+    def test_a_silence_gap_prevents_revision(self, tmp_path):
+        """Nothing overlaps across a pause, so the earlier text is final."""
+        script = ["first utterance stands", "", "a separate later remark"]
+        body, _ = run(tmp_path, script, [YOU] * 3)
+
+        assert "first utterance stands" in body
+        assert "a separate later remark" in body
+
+    def test_three_windows_keep_converging(self, tmp_path):
+        script = [
+            "the deploy failed because of",
+            "the deploy failed because of the cache",
+            "the deploy failed because of the cache invalidation bug",
+        ]
+        body, _ = run(tmp_path, script, [MEETING] * 3)
+
+        assert spoken(body).count("the deploy failed because of") == 1
+        assert "cache invalidation bug" in spoken(body)
+
+    def test_markdown_stays_well_formed(self, tmp_path):
+        script = ["alpha beta", "alpha beta gamma", "alpha beta gamma delta"]
+        body, _ = run(tmp_path, script, [YOU] * 3)
+
+        assert body.startswith("---\n")
+        assert body.count("**You**:") == 1
+        assert spoken(body) == "alpha beta gamma delta"
 
 
 class TestAttribution:

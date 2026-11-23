@@ -506,19 +506,24 @@ function addSegments(segments) {
       $("turns").append(turn);
       lastSpeaker = seg.speaker;
     }
-    const what = $("turns").lastElementChild.querySelector(".what");
+    const turn = $("turns").lastElementChild;
+    const what = turn.querySelector(".what");
     const span = document.createElement("span");
     span.className = "fresh";
+    // Each segment is its own addressable node, so a later window can replace
+    // it when it re-transcribes the same audio more accurately.
+    span.dataset.id = seg.id;
     span.textContent = (what.textContent ? " " : "") + seg.text;
     what.append(span);
 
     if (seg.reason) {
       const why = document.createElement("div");
       why.className = "why";
+      why.dataset.id = seg.id;
       why.textContent =
         `#${seg.id} ${seg.speaker} — mic +${fmt(seg.mic_db)}dB vs ` +
         `meeting +${fmt(seg.meeting_db)}dB — ${seg.reason}`;
-      $("turns").lastElementChild.append(why);
+      turn.append(why);
     }
   }
 
@@ -527,6 +532,24 @@ function addSegments(segments) {
 }
 
 function fmt(v) { return v === null || v === undefined ? "?" : v.toFixed(1); }
+
+/* A later window re-transcribed audio already on screen, with the following
+   context the first pass lacked. Drop what it supersedes and re-render. */
+function reviseSegments(fromId, segments) {
+  for (const node of $("turns").querySelectorAll("[data-id]")) {
+    if (Number(node.dataset.id) >= fromId) node.remove();
+  }
+  for (const turn of [...$("turns").querySelectorAll(".turn")]) {
+    if (!turn.querySelector(".what").textContent.trim()) turn.remove();
+  }
+
+  const turns = $("turns").querySelectorAll(".turn");
+  lastSpeaker = turns.length
+    ? turns[turns.length - 1].querySelector(".who").textContent
+    : null;
+
+  addSegments(segments);
+}
 
 function addNotice(ev) {
   const el = document.createElement("div");
@@ -587,6 +610,7 @@ function connect() {
     const ev = JSON.parse(e.data);
     if (ev.type === "levels") renderLevels(ev);
     else if (ev.type === "segments") addSegments(ev.segments);
+    else if (ev.type === "revise") reviseSegments(ev.from_id, ev.segments);
     else if (ev.type === "state") setState(ev.value);
     else if (ev.type === "notice") addNotice(ev);
     else if (ev.type === "session" && ev.markdown) {

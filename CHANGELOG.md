@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.3.0 — 2026-11-23
+
+### Changed
+
+- **Window boundaries no longer keep a wrong guess.** Consecutive windows
+  overlap, so the last batch's audio is transcribed a second time — with the
+  following context the first pass lacked. Observed live: "Airbnb has the same
+  purpose." became "...the same problem when two guests book..." on the second
+  pass, but the first guess had already been written. The second reading now
+  replaces the first instead of being appended around it.
+
+  Replacement is only attempted when the new window re-transcribes the previous
+  batch *in full*. A partial match would delete the part the window does not
+  cover, and a match reaching further back than the batch would duplicate text
+  written before it — both were reproduced in testing and are now refused
+  outright, falling back to plain appending.
+
+- The engine publishes a `revise` event carrying the id to replace from, and
+  the UI swaps the affected text in place. Each segment is rendered as its own
+  addressable node for this.
+
+- Transcript statistics are recomputed from what is on disk after each write,
+  rather than accumulated, so a revision cannot leave the counts drifting.
+
 ## 2.2.0 — 2026-11-23
 
 ### Added

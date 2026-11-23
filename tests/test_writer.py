@@ -162,6 +162,105 @@ class TestSidecar:
         assert data["title"] == "Quarterly review"
 
 
+class TestRevise:
+    """Consecutive windows overlap, so the last batch's audio is transcribed a
+    second time with the following context the first pass lacked. The better
+    reading replaces the first rather than being appended around it."""
+
+    def test_the_last_batch_is_replaced(self, raw_dir):
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "the same purpose"}])
+        assert writer.revise_last_batch(
+            [{"speaker": "You", "text": "the same problem"}]
+        )
+
+        body = writer.path.read_text(encoding="utf-8")
+        assert "the same problem" in body
+        assert "the same purpose" not in body
+
+    def test_earlier_batches_are_untouched(self, raw_dir):
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "first batch stays"}])
+        writer.append_segments([{"speaker": "Meeting", "text": "second guess"}])
+        writer.revise_last_batch([{"speaker": "Meeting", "text": "second corrected"}])
+
+        body = writer.path.read_text(encoding="utf-8")
+        assert "first batch stays" in body
+        assert "second corrected" in body
+        assert "second guess" not in body
+
+    def test_speaker_state_is_restored(self, raw_dir):
+        """A revision may change the speaker, so continuation state must roll
+        back too or the turn structure drifts."""
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "mine"}])
+        writer.append_segments([{"speaker": "You", "text": "continues"}])
+        writer.revise_last_batch([{"speaker": "Meeting", "text": "actually theirs"}])
+
+        body = writer.path.read_text(encoding="utf-8")
+        assert body.count("**You**:") == 1
+        assert body.count("**Meeting**:") == 1
+        assert "continues" not in body
+
+    def test_revision_can_change_the_segment_count(self, raw_dir):
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "one guess"}])
+        writer.revise_last_batch([
+            {"speaker": "You", "text": "first part"},
+            {"speaker": "Meeting", "text": "second part"},
+        ])
+
+        body = writer.path.read_text(encoding="utf-8")
+        assert "one guess" not in body
+        assert "first part" in body and "second part" in body
+
+    def test_the_sidecar_follows_the_revision(self, raw_dir):
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "wrong text"}])
+        writer.revise_last_batch([{"speaker": "You", "text": "right text"}])
+
+        data = json.loads(writer.sidecar_path.read_text(encoding="utf-8"))
+        texts = [s["text"] for s in data["segments"]]
+        assert texts == ["right text"]
+
+    def test_revising_with_nothing_written_yet_fails_cleanly(self, raw_dir):
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        assert writer.revise_last_batch([{"speaker": "You", "text": "x"}]) is False
+        assert writer.path is None
+
+    def test_a_batch_can_only_be_revised_once(self, raw_dir):
+        """After a revision the batch is the new last batch — not the old one."""
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "v1"}])
+        writer.revise_last_batch([{"speaker": "You", "text": "v2"}])
+        writer.revise_last_batch([{"speaker": "You", "text": "v3"}])
+
+        body = writer.path.read_text(encoding="utf-8")
+        assert "v3" in body
+        assert "v1" not in body and "v2" not in body
+
+    def test_sealing_prevents_revision(self, raw_dir):
+        """Speech stopped, so a later window cannot overlap this batch."""
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "final words"}])
+        writer.seal()
+
+        assert writer.has_revisable_batch is False
+        assert writer.revise_last_batch([{"speaker": "You", "text": "nope"}]) is False
+        assert "final words" in writer.path.read_text(encoding="utf-8")
+
+    def test_file_stays_valid_markdown_after_revision(self, raw_dir):
+        writer = TranscriptWriter(raw_dir=raw_dir)
+        writer.append_segments([{"speaker": "You", "text": "alpha"}])
+        writer.append_segments([{"speaker": "Meeting", "text": "beta"}])
+        writer.revise_last_batch([{"speaker": "Meeting", "text": "gamma"}])
+
+        body = writer.path.read_text(encoding="utf-8")
+        assert body.startswith("---\n")
+        assert body.endswith("\n")
+        assert "\n\n\n" not in body.split("# ", 1)[1]
+
+
 class TestPlainMode:
     def test_append_text_uses_a_neutral_label(self, raw_dir):
         writer = TranscriptWriter(raw_dir=raw_dir)

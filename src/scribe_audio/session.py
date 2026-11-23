@@ -28,7 +28,13 @@ from typing import Any, Callable
 import numpy as np
 
 from .capture import DualStreamCapture, Window
-from .dedup import find_new_index, segment_words, slice_segments
+from .dedup import (
+    align_tail,
+    find_new_index,
+    head_segments,
+    segment_words,
+    slice_segments,
+)
 from .speakers import SpeakerDetector, label_segments
 from .transcriber import Transcriber
 from .writer import TranscriptWriter
@@ -182,6 +188,12 @@ class RecordingSession:
 
         self._next_segment_id = 1
         self._prev_words: list[str] = []
+        # First id of the batch that may still be revised, so a consumer knows
+        # which rendered segments to replace.
+        self._revisable_from_id: int | None = None
+        # Words of the last written batch, aligned against each new window to
+        # decide whether that batch can be replaced wholesale.
+        self._batch_words: list[str] = []
         self._reported_stalls: set[str] = set()
         self._silent_windows = 0
         self._warned_silent = False
@@ -371,8 +383,12 @@ class RecordingSession:
         if not segments:
             # Silence: previous text is older than this window, so it cannot
             # overlap the next one. Keeping it would let stale text swallow the
-            # start of the next utterance.
+            # start of the next utterance, and nothing earlier is revisable.
             self._prev_words = []
+            self._batch_words = []
+            if self.writer is not None:
+                self.writer.seal()
+            self._revisable_from_id = None
             return
 
         if self.use_speakers:
@@ -392,44 +408,99 @@ class RecordingSession:
             return
 
         curr_words = segment_words(labelled)
-        fresh = slice_segments(labelled, find_new_index(self._prev_words, curr_words))
+
+        # Can this window replace the last batch outright? Only if it
+        # re-transcribes that batch in full — see align_tail. When it does, the
+        # second reading wins: it had the following context the first pass
+        # lacked ("the same purpose" becoming "the same problem").
+        covered = (
+            align_tail(self._batch_words, curr_words)
+            if self.writer.has_revisable_batch else 0
+        )
+
+        if covered:
+            revision = head_segments(labelled, covered)
+            fresh = slice_segments(labelled, covered)
+        else:
+            # Fall back to appending only what is new relative to the previous
+            # window, leaving everything already written untouched.
+            revision = []
+            fresh = slice_segments(
+                labelled, find_new_index(self._prev_words, curr_words)
+            )
+            self.writer.seal()
+
         self._prev_words = curr_words
-        if not fresh:
+
+        revised_from = None
+        if revision:
+            revised_from = self._revisable_from_id
+            self._assign_ids(revision)
+            if self.writer.revise_last_batch(revision):
+                self._recount()
+            else:
+                revised_from = None
+
+        if fresh:
+            self._assign_ids(fresh)
+            self.writer.append_segments(fresh)
+            self._recount()
+
+        if not revision and not fresh:
             return
 
-        for seg in fresh:
+        self._announce_path()
+        # The batch just written is what the next window may revise.
+        last_batch = fresh if fresh else revision
+        self._revisable_from_id = last_batch[0]["id"] if last_batch else None
+        self._batch_words = segment_words(last_batch)
+        if final:
+            self.writer.seal()
+            self._revisable_from_id = None
+            self._batch_words = []
+
+        if revised_from is not None:
+            self.bus.publish({
+                "type": "revise",
+                "from_id": revised_from,
+                "segments": [self._wire(s) for s in revision + fresh],
+            })
+        else:
+            self.bus.publish({
+                "type": "segments",
+                "final": final,
+                "segments": [self._wire(s) for s in revision + fresh],
+            })
+
+    def _assign_ids(self, segments: list[dict]) -> None:
+        for seg in segments:
             seg["id"] = self._next_segment_id
             self._next_segment_id += 1
 
-        self.writer.append_segments(fresh)
-        self._announce_path()
+    def _recount(self) -> None:
+        """Recompute totals from what is actually on disk after a revision."""
+        written = self.writer.segments if self.writer else []
+        self.stats.segments = len(written)
+        self.stats.words = sum(len(s["text"].split()) for s in written)
+        counts: dict[str, int] = {}
+        for seg in written:
+            counts[seg["speaker"]] = counts.get(seg["speaker"], 0) + 1
+        self.stats.speakers = counts
 
-        for seg in fresh:
-            self.stats.segments += 1
-            self.stats.words += len(seg["text"].split())
-            speaker = seg["speaker"]
-            self.stats.speakers[speaker] = self.stats.speakers.get(speaker, 0) + 1
-
-        self.bus.publish({
-            "type": "segments",
-            "final": final,
-            "segments": [
-                {
-                    "id": s["id"],
-                    "speaker": s["speaker"],
-                    "text": s["text"],
-                    "start": s.get("start"),
-                    "end": s.get("end"),
-                    # Why this speaker was chosen — surfaced in the UI so an
-                    # unexpected label can be diagnosed from the transcript
-                    # itself rather than by re-recording with --debug.
-                    "reason": s.get("reason"),
-                    "mic_db": s.get("mic_db"),
-                    "meeting_db": s.get("meeting_db"),
-                }
-                for s in fresh
-            ],
-        })
+    @staticmethod
+    def _wire(seg: dict) -> dict:
+        return {
+            "id": seg["id"],
+            "speaker": seg["speaker"],
+            "text": seg["text"],
+            "start": seg.get("start"),
+            "end": seg.get("end"),
+            # Why this speaker was chosen — surfaced in the UI so an unexpected
+            # label can be diagnosed from the transcript itself.
+            "reason": seg.get("reason"),
+            "mic_db": seg.get("mic_db"),
+            "meeting_db": seg.get("meeting_db"),
+        }
 
     def _announce_language(self) -> None:
         """Report the detected language once, when running with language=auto."""

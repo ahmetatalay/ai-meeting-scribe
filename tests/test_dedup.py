@@ -13,8 +13,10 @@ phenomenon that broke it:
 """
 
 from scribe_audio.dedup import (
+    align_tail,
     extract_new_text,
     find_new_index,
+    head_segments,
     normalise_word,
     segment_words,
     slice_segments,
@@ -197,6 +199,67 @@ class TestSegmentSlicing:
         text = " ".join(s["text"] for s in out)
         assert "ship the build" not in text
         assert text == "sounds good to me"
+
+
+class TestAlignTail:
+    """Whether the current window re-transcribes the last batch in full.
+
+    Replacing that batch is only safe when the answer is yes: a partial match
+    would delete the part the window does not cover, and a match reaching
+    further back than the batch would duplicate text written before it.
+    """
+
+    def test_a_batch_fully_restated_is_covered(self):
+        batch = "we should ship the build".split()
+        curr = "we should ship the build today".split()
+        assert align_tail(batch, curr) == 5
+
+    def test_a_reworded_last_word_still_counts(self):
+        """The whole point: the second pass corrects the boundary word."""
+        batch = "Airbnb has the same purpose".split()
+        curr = "Airbnb has the same problem when two guests book".split()
+        assert align_tail(batch, curr) == 4
+
+    def test_a_match_starting_later_in_the_window_is_refused(self):
+        """Those earlier words belong to audio already written.
+
+        Accepting this duplicated text: 'alpha beta' + 'alpha beta gamma'.
+        """
+        batch = ["gamma"]
+        curr = "alpha beta gamma delta".split()
+        assert align_tail(batch, curr) == 0
+
+    def test_a_partially_covered_batch_is_refused(self):
+        """Replacing it would delete 'alpha beta'."""
+        batch = "alpha beta gamma delta".split()
+        curr = "gamma delta epsilon".split()
+        assert align_tail(batch, curr) == 0
+
+    def test_an_unrelated_window_is_refused(self):
+        assert align_tail("one two three".split(), "four five six".split()) == 0
+
+    def test_a_batch_restated_with_nothing_new(self):
+        batch = "the same words again".split()
+        assert align_tail(batch, list(batch)) == 4
+
+    def test_empty_inputs(self):
+        assert align_tail([], ["a"]) == 0
+        assert align_tail(["a"], []) == 0
+
+    def test_covered_count_never_exceeds_the_window(self):
+        batch = "a b c".split()
+        curr = "a b".split()
+        assert align_tail(batch, curr) <= len(curr)
+
+    def test_a_long_batch_with_an_internal_rewording(self):
+        batch = "the cache layer is returning stale keys".split()
+        curr = "the cache layer is returning stale keys again today".split()
+        assert align_tail(batch, curr) == 7
+
+    def test_repeated_phrase_does_not_create_a_false_cover(self):
+        batch = ["yeah"]
+        curr = "something else entirely yeah".split()
+        assert align_tail(batch, curr) == 0
 
 
 class TestFindNewIndex:

@@ -413,3 +413,82 @@ class TestSpeakerlessMode:
             tmp_path, ["text"], [make_window()], use_speakers=False
         )
         assert session.use_speakers is False
+
+
+class TestTailRevision:
+    """When a window re-transcribes the last batch, consumers are told to
+    replace what they have rather than being handed overlapping text."""
+
+    def test_a_revise_event_is_published(self, tmp_path):
+        session, _, _ = build(
+            tmp_path,
+            ["Airbnb has the same purpose",
+             "Airbnb has the same problem when two guests book"],
+            [make_window("Meeting", seed=0), make_window("Meeting", seed=10)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        events = drain(q)
+        revisions = of_type(events, "revise")
+        assert revisions, [e["type"] for e in events]
+
+        first_ids = [s["id"] for e in of_type(events, "segments") for s in e["segments"]]
+        assert revisions[0]["from_id"] == min(first_ids)
+
+    def test_the_revision_carries_the_corrected_text(self, tmp_path):
+        session, _, _ = build(
+            tmp_path,
+            ["we will discuss the migra", "we will discuss the migration next week"],
+            [make_window("You", seed=0), make_window("You", seed=10)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        revision = of_type(drain(q), "revise")[0]
+        text = " ".join(s["text"] for s in revision["segments"])
+        assert "migration next week" in text
+
+    def test_ids_in_a_revision_are_new(self, tmp_path):
+        """Replaced text gets fresh ids, so nothing stale lingers on screen."""
+        session, _, _ = build(
+            tmp_path,
+            ["alpha beta", "alpha beta gamma delta"],
+            [make_window("You", seed=0), make_window("You", seed=10)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        events = drain(q)
+        revisions = of_type(events, "revise")
+        if revisions:
+            revision = revisions[0]
+            assert all(s["id"] >= revision["from_id"] for s in revision["segments"])
+
+    def test_a_silence_gap_publishes_no_revision(self, tmp_path):
+        session, _, _ = build(
+            tmp_path,
+            ["first utterance", "", "a separate later remark"],
+            [make_window("You", seed=i * 10) for i in range(3)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+        assert of_type(drain(q), "revise") == []
+
+    def test_stats_follow_the_file_after_a_revision(self, tmp_path):
+        """Counts are recomputed from disk, not accumulated."""
+        session, _, _ = build(
+            tmp_path,
+            ["one two three", "one two three four five"],
+            [make_window("You", seed=0), make_window("You", seed=10)],
+        )
+        session.start()
+        session.wait(timeout=5)
+
+        written = session.writer.segments
+        assert session.stats.segments == len(written)
+        assert session.stats.words == sum(len(s["text"].split()) for s in written)
