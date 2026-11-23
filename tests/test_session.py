@@ -7,6 +7,7 @@ runs deterministically in-process.
 
 import json
 import queue
+import re
 
 import pytest
 
@@ -246,6 +247,64 @@ class TestHealthNotices:
         assert notices and notices[0]["seconds"] == 12.0
         assert session.stats.dropped_seconds == 12.0
 
+    def test_sub_second_overruns_are_not_reported(self, tmp_path):
+        """Observed in a real meeting: a stream of warnings reading
+        "Transcription fell behind: 0s of audio was not transcribed. Try a
+        smaller model." A window is emitted on wall-clock time, so a cycle
+        finishing 0.4s late is scheduling jitter, not lost audio — and the
+        advice to change model was wrong as well as alarming."""
+        session, _, _ = build(
+            tmp_path, ["some speech"], [make_window(dropped=0.4)]
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        notices = [e for e in of_type(drain(q), "notice")
+                   if e["code"] == "dropped_audio"]
+        assert notices == []
+
+    def test_a_real_shortfall_is_still_reported(self, tmp_path):
+        session, _, _ = build(
+            tmp_path, ["some speech"], [make_window(dropped=4.0)]
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        notices = [e for e in of_type(drain(q), "notice")
+                   if e["code"] == "dropped_audio"]
+        assert len(notices) == 1
+
+    def test_a_reported_shortfall_never_reads_as_zero(self, tmp_path):
+        """Whatever the threshold, the number shown must not round to 0."""
+        from scribe_audio.session import DROPPED_AUDIO_FLOOR
+
+        session, _, _ = build(
+            tmp_path, ["some speech"],
+            [make_window(dropped=DROPPED_AUDIO_FLOOR)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        notices = [e for e in of_type(drain(q), "notice")
+                   if e["code"] == "dropped_audio"]
+        assert notices, "the floor itself must still report"
+
+        amount = re.search(r"fell behind: (\S+) of audio",
+                           notices[0]["message"]).group(1)
+        assert float(amount.rstrip("s")) > 0, f"rendered as {amount}"
+
+    def test_short_overruns_still_count_towards_the_total(self, tmp_path):
+        """Not worth a banner, but the statistic should stay honest."""
+        session, _, _ = build(
+            tmp_path, ["some speech"], [make_window(dropped=0.4)]
+        )
+        session.start()
+        session.wait(timeout=5)
+        assert session.stats.dropped_seconds == pytest.approx(0.4)
+
     def test_silent_loopback_with_speech_is_reported(self, tmp_path):
         """The Zoom-bypass signature."""
         session, _, _ = build(
@@ -274,6 +333,54 @@ class TestHealthNotices:
 
         codes = [e["code"] for e in of_type(drain(q), "notice")]
         assert "loopback_silent" not in codes
+
+    def test_the_silent_loopback_warning_is_withdrawn_when_audio_arrives(
+        self, tmp_path
+    ):
+        """Seen on screen: two "No meeting audio is arriving" banners sitting
+        above a transcript that plainly contained meeting speech, with every
+        setup check green. The warning was true when raised and never retracted,
+        so it sent the reader to re-check routing that already worked."""
+        session, _, _ = build(
+            tmp_path,
+            ["I am talking", "still talking about other things",
+             "now they reply to me at some length"],
+            [make_window("You", seed=0, meeting_silent=True),
+             make_window("You", seed=10, meeting_silent=True),
+             make_window("Meeting", seed=20)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        silent = [e for e in of_type(drain(q), "notice")
+                  if e["code"] == "loopback_silent"]
+        assert len(silent) == 2, "expected the warning and its retraction"
+        assert silent[0].get("resolved") is not True
+        assert silent[1]["resolved"] is True
+
+    def test_the_silent_warning_can_fire_again_after_recovering(self, tmp_path):
+        """Routing that breaks a second time must warn a second time."""
+        session, _, _ = build(
+            tmp_path,
+            ["I am talking", "still talking about other things",
+             "now they reply to me at some length",
+             "and I am speaking once more here",
+             "continuing to speak with nothing coming back"],
+            [make_window("You", seed=0, meeting_silent=True),
+             make_window("You", seed=10, meeting_silent=True),
+             make_window("Meeting", seed=20),
+             make_window("You", seed=30, meeting_silent=True),
+             make_window("You", seed=40, meeting_silent=True)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        silent = [e for e in of_type(drain(q), "notice")
+                  if e["code"] == "loopback_silent"]
+        warnings = [e for e in silent if not e.get("resolved")]
+        assert len(warnings) == 2, f"expected two warnings, got {len(silent)}"
 
     def test_a_stalled_stream_is_reported_once(self, tmp_path):
         session, _, _ = build(

@@ -609,11 +609,34 @@ function reviseSegments(fromId, segments) {
   addSegments(segments);
 }
 
+// One banner per kind of problem, not one per occurrence. Falling behind
+// repeatedly produced a fresh banner each window and eight of them pushed the
+// transcript off screen — the thing you are actually trying to read.
 function addNotice(ev) {
+  const box = $("notices");
+  const existing = ev.code
+    ? box.querySelector(`[data-code="${CSS.escape(ev.code)}"]`)
+    : null;
+
+  // A resolved condition retracts its warning rather than adding to the pile.
+  if (ev.resolved) {
+    if (existing) existing.remove();
+    return;
+  }
+
+  if (existing) {
+    const seen = (Number(existing.dataset.seen) || 1) + 1;
+    existing.dataset.seen = seen;
+    existing.textContent = `${ev.message} (×${seen})`;
+    return;
+  }
+
   const el = document.createElement("div");
   el.className = "notice " + ev.level;
   el.textContent = ev.message;
-  $("notices").append(el);
+  if (ev.code) el.dataset.code = ev.code;
+  el.dataset.seen = 1;
+  box.append(el);
   if (ev.level === "info") setTimeout(() => el.remove(), 6000);
 }
 

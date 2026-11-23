@@ -18,7 +18,23 @@ transcripts from flipping speaker mid-sentence.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+
+def _supported_devices() -> set[str]:
+    """Which ctranslate2 backends this build can actually use."""
+    import ctranslate2
+
+    found = set()
+    for device in ("cpu", "cuda", "mps"):
+        try:
+            ctranslate2.get_supported_compute_types(device)
+        except Exception:
+            continue
+        found.add(device)
+    return found
 
 DEFAULT_MODEL = "small"
 
@@ -142,7 +158,17 @@ class Transcriber:
 
     def load(self) -> None:
         """Load the model, downloading it on first use."""
+        import ctranslate2
         from faster_whisper import WhisperModel
+
+        # ctranslate2 prints a tip on every load suggesting device="mps" as
+        # "often 2x+ faster". On this build MPS is not compiled in at all —
+        # get_supported_compute_types("mps") raises "unsupported device mps" —
+        # so the tip advertises a backend that cannot be selected, once per
+        # model load, into the middle of the transcript stream. Errors still
+        # come through.
+        if "mps" not in _supported_devices():
+            ctranslate2.set_log_level(logging.ERROR)
 
         self._model = WhisperModel(
             self.model_size,

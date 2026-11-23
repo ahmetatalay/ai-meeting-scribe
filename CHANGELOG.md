@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.4.1 — 2026-11-23
+
+### Fixed
+
+- **Warnings that were wrong, unactionable, or never withdrawn.** All four were
+  seen in one real meeting, where eight stacked banners pushed the transcript
+  off screen — the thing the window exists to show.
+
+  "Transcription fell behind: **0s** of audio was not transcribed. Try a
+  smaller model." A window is emitted on wall-clock time, so a cycle finishing
+  0.4s late tripped a `> 0` check and then rendered as `0s` through `:.0f`.
+  That is scheduling jitter, no audio was lost, and changing model would not
+  have helped. Only a shortfall of a second or more is reported now, never
+  rounded to zero; shorter overruns still count towards the session total so
+  the statistic stays honest.
+
+  Notices appended one banner per occurrence. Repeated conditions now coalesce
+  into a single banner with an occurrence count.
+
+  "No meeting audio is arriving" stayed on screen after meeting audio started
+  arriving — two of them sat above a transcript plainly containing meeting
+  speech, with every setup check green, sending the reader to re-check routing
+  that already worked. The warning is withdrawn when audio returns, and can
+  fire again if routing breaks a second time.
+
+- **A ctranslate2 tip advertising a backend that does not exist.** Every model
+  load printed "experimental MPS backend is available and often 2x+ faster,
+  try device=mps" into the transcript stream. On this build MPS is not
+  compiled in — `get_supported_compute_types("mps")` raises "unsupported
+  device mps" — so the suggestion could not be taken. Suppressed when MPS is
+  genuinely unavailable; errors still come through.
+
 ## 2.4.0 — 2026-11-23
 
 ### Added

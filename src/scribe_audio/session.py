@@ -52,6 +52,11 @@ STATE_ERROR = "error"
 # reporting a routing problem.
 SILENT_LOOPBACK_WINDOWS = 2
 
+# Shortfall below which falling behind is not worth reporting. A window is
+# emitted on wall-clock time, so a cycle finishing a few hundred milliseconds
+# late is normal scheduling jitter and loses no audio worth naming.
+DROPPED_AUDIO_FLOOR = 1.0
+
 # Per-subscriber queue depth. A slow consumer loses the oldest events rather
 # than stalling the capture loop.
 QUEUE_DEPTH = 512
@@ -673,27 +678,36 @@ class RecordingSession:
     def _check_health(self, window: Window) -> None:
         assert self.capture is not None
 
+        # Sub-second overruns are scheduling jitter on a 30-second window, not
+        # audio anyone lost, and they produced a stream of warnings reading
+        # "fell behind: 0s ... try a smaller model" — alarming, unactionable
+        # and wrong. Only a real shortfall is worth saying, and it is never
+        # rendered as "0s".
         if window.dropped_seconds > 0:
             self.stats.dropped_seconds += window.dropped_seconds
+        if window.dropped_seconds >= DROPPED_AUDIO_FLOOR:
+            lost = window.dropped_seconds
+            amount = f"{lost:.0f}s" if lost >= 10 else f"{lost:.1f}s"
             self.bus.publish({
                 "type": "notice",
                 "level": "warning",
                 "code": "dropped_audio",
-                "seconds": window.dropped_seconds,
+                "seconds": lost,
                 "message": (
-                    f"Transcription fell behind: {window.dropped_seconds:.0f}s of "
-                    f"audio was not transcribed. Try a smaller model."
+                    f"Transcription fell behind: {amount} of audio was not "
+                    f"transcribed. Try a smaller model."
                 ),
             })
 
         # The mis-routing signature: speech is being transcribed while the
         # loopback carries nothing, so only one side is reaching us. Requiring
         # transcribed speech avoids firing during a quiet start.
-        if self.config.system_device is not None and not self._warned_silent:
+        if self.config.system_device is not None:
             silent = float(np.max(np.abs(window.meeting))) < 1e-4
             if silent and self._prev_words:
                 self._silent_windows += 1
-                if self._silent_windows >= SILENT_LOOPBACK_WINDOWS:
+                if (self._silent_windows >= SILENT_LOOPBACK_WINDOWS
+                        and not self._warned_silent):
                     self._warned_silent = True
                     self.bus.publish({
                         "type": "notice",
@@ -707,6 +721,18 @@ class RecordingSession:
                     })
             elif not silent:
                 self._silent_windows = 0
+                # Meeting audio started arriving, so the warning is now false.
+                # Leaving it on screen sent people to re-check routing that was
+                # already working — withdraw it instead.
+                if self._warned_silent:
+                    self._warned_silent = False
+                    self.bus.publish({
+                        "type": "notice",
+                        "code": "loopback_silent",
+                        "resolved": True,
+                        "message": "Meeting audio is arriving.",
+                        "level": "info",
+                    })
 
         for stalled in self.capture.stalled_streams:
             if stalled not in self._reported_stalls:
