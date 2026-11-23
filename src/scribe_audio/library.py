@@ -185,6 +185,7 @@ def describe(path: Path, raw_dir: Path) -> dict:
         "words": _word_count(body),
         "speakers": counts,
         "has_sidecar": bool(sidecar),
+        "has_summary": bool((sidecar.get("summary") or {}).get("text")),
         "is_recording": is_recording,
         "relative_path": str(path.relative_to(raw_dir)) if path.is_relative_to(raw_dir)
                          else path.name,
@@ -249,6 +250,7 @@ def read(raw_dir: Path | str, name: str) -> dict:
         raise LibraryError(f"not a scribe recording: {name!r}")
     body = path.read_text(encoding="utf-8", errors="replace")
     entry["turns"] = parse_turns(body)
+    entry["summary"] = (_load_sidecar(path).get("summary") or None)
     return entry
 
 
@@ -275,6 +277,56 @@ def parse_turns(body: str) -> list[dict]:
     return [t for t in turns if t["text"]]
 
 
+def _load_sidecar(path: Path) -> dict:
+    sidecar_path = path.with_suffix(".json")
+    if not sidecar_path.is_file():
+        return {}
+    try:
+        return json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_sidecar(path: Path, data: dict) -> None:
+    sidecar_path = path.with_suffix(".json")
+    tmp = sidecar_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(sidecar_path)
+
+
+def get_summary(raw_dir: Path | str, name: str) -> dict | None:
+    """The stored summary for a recording, if one has been generated."""
+    path = resolve(raw_dir, name)
+    if not path.is_file():
+        raise FileNotFoundError(name)
+    summary = _load_sidecar(path).get("summary") or None
+    return summary if summary and summary.get("text") else None
+
+
+def set_summary(raw_dir: Path | str, name: str, summary: dict) -> dict:
+    """Store a summary in the sidecar.
+
+    The sidecar rather than the markdown: the transcript is append-and-revise
+    during recording, so inserting a section into it would collide with the
+    tail-revision offsets.
+    """
+    if not (summary.get("text") or "").strip():
+        raise LibraryError("summary text must not be empty")
+
+    path = resolve(raw_dir, name)
+    if not path.is_file():
+        raise FileNotFoundError(name)
+    directory = Path(raw_dir).expanduser().resolve()
+    if not describe(path, directory)["is_recording"]:
+        raise LibraryError(f"not a scribe recording: {name!r}")
+
+    data = _load_sidecar(path)
+    data.setdefault("markdown", path.name)
+    data["summary"] = summary
+    _save_sidecar(path, data)
+    return summary
+
+
 def set_title(raw_dir: Path | str, name: str, title: str) -> dict:
     """Rename a recording. Writes the sidecar, never the transcript."""
     title = title.strip()
@@ -285,19 +337,10 @@ def set_title(raw_dir: Path | str, name: str, title: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(name)
 
-    sidecar_path = path.with_suffix(".json")
-    data: dict = {}
-    if sidecar_path.is_file():
-        try:
-            data = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            data = {}
+    data = _load_sidecar(path)
     data.setdefault("markdown", path.name)
     data["title"] = title
-
-    tmp = sidecar_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(sidecar_path)
+    _save_sidecar(path, data)
     return {"name": path.name, "title": title}
 
 

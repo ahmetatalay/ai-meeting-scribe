@@ -2,7 +2,7 @@
 
 Scribe transcribes meetings on your own machine. It captures audio from any meeting platform — Microsoft Teams, Zoom, Slack Huddle, Google Meet — transcribes it locally with Whisper, and labels who was speaking.
 
-Nothing leaves your laptop: no account, no API key, no network calls after the model is downloaded once.
+Nothing leaves your laptop: no account, no API key, and no connection to anything off the machine once the models are downloaded. Summaries run on a local model too — the only traffic is to `127.0.0.1`.
 
 ## How it works
 
@@ -75,10 +75,12 @@ scribe warns about this at runtime as soon as it sees your speech with a silent 
 ```bash
 uv sync --extra web
 
-scribe doctor      # check the audio setup
-scribe web         # browser UI (recommended)
-scribe record      # or stay in the terminal; Ctrl+C to stop
+uv run scribe doctor      # check the audio setup
+uv run scribe web         # browser UI (recommended)
+uv run scribe record      # or stay in the terminal; Ctrl+C to stop
 ```
+
+Drop the `uv run` once you have installed it globally — see [Install globally](#install-globally).
 
 ## Web UI
 
@@ -89,11 +91,35 @@ scribe web --no-browser
 scribe web --raw ~/Desktop/transcripts
 ```
 
-Two tabs:
+Two tabs, **Record** and **Library**.
 
 **Record** — pick your microphone and meeting-audio device, press **Start transcribing**, and the transcript appears as it is produced. Two live level meters sit under the controls: if the **Meeting** meter stays flat, the meeting audio is not reaching scribe and you can fix it in seconds instead of discovering it after the call. The **Why?** toggle shows the per-segment speaker decision and the dB numbers behind it.
 
-**Library** — every recording in your output directory, newest first, with title, date, duration, word count and speaker breakdown. Click one to read it, rename it inline, or delete it. Search covers both titles and transcript bodies.
+### Summaries
+
+A "Notes so far" panel sits above the live transcript, refreshed when you press **Refresh**; past recordings get a **Summarise** button in the reader. Both run on a local model via [Ollama](https://ollama.com), so transcripts still never leave the machine:
+
+```bash
+brew install ollama
+brew services start ollama
+ollama pull qwen2.5:14b          # ~9GB; 32b is better if you have the RAM
+```
+
+Run it as a service rather than `ollama serve &` in a terminal. Ollama has no log-level setting — it forwards the bundled llama.cpp server's per-request log (sampler parameters, slot state, token timings) plus its own HTTP access log, unconditionally, and in a terminal that buries everything else. As a service it writes to `/opt/homebrew/var/log/ollama.log` instead.
+
+Homebrew's service also sets `OLLAMA_KV_CACHE_TYPE=q8_0`, which is worth having: measured here it took the KV cache from 1536MB to 816MB with no visible quality change.
+
+The live summary is **incremental**: each press reads only what has been said since the last one, plus the summary it already wrote, and returns an updated whole. So pressing Refresh during a long meeting costs about the same as pressing it early on.
+
+It is **on demand, not on a timer.** A 14B model holds around 10GB while loaded and takes several seconds per pass; refreshing automatically every few seconds kept it resident permanently and pushed a 48GB machine 23GB into swap. Between summaries the model is released entirely. Turn automatic refresh on with `scribe web --auto-notes 30` if you want it, knowing the cost.
+
+The summary is maintained on the server, not in the browser, so it survives a reload and is saved with the recording when you stop. It is written in English whatever language the meeting is in.
+
+scribe tells you in the UI if Ollama is not running, and the Summarise button stays disabled rather than failing mid-request. Pick models with `scribe web --summary-model qwen2.5:32b --notes-model qwen2.5:7b` — the live panel benefits from a faster model, the final write-up from a better one.
+
+### Library
+
+Every recording in your output directory, newest first, with title, date, duration, word count and speaker breakdown. Click one to read it, rename it inline, or delete it. Search covers both titles and transcript bodies.
 
 Recordings made before sidecars existed are listed too: the date comes from the filename and the title from the document heading. Renaming only ever writes the JSON sidecar, so your markdown is never rewritten.
 
@@ -159,9 +185,11 @@ A recording started in the same minute as an existing one gets a `-2` suffix rat
 ## Install globally
 
 ```bash
-uv tool install .
+uv tool install '.[web]'
 scribe record --raw ~/Desktop/transcripts
 ```
+
+The `[web]` extra is what provides `scribe web`; installing without it gives you a `scribe` with no `web` subcommand. Add `--force` to replace an older install — otherwise `uv` leaves the existing one in place and you keep running the old build.
 
 ## Environment variables
 
@@ -190,6 +218,12 @@ Your microphone carries only your voice; BlackHole carries only the meeting. For
 A fixed threshold does not work. A near-field headset mic is simply louder than post-mixer loopback audio, so comparing raw levels attributes everything to you. Measuring each channel against its own floor also handles the opposite case, where a built-in mic picks up the laptop speakers — that bleed is attenuated, so it stays below the loopback's.
 
 Decisions are made per segment, not per word, so a sentence is never split between speakers.
+
+## Why summaries cover one meeting at a time
+
+A summary reads only the recording it belongs to. Handing a model several unrelated transcripts and asking it to summarise one produces confident invented cross-references — "as agreed on 21 October" for an agreement that never happened — and a meeting summary gets treated as a record of fact. The transcripts are also noisy, so cross-referencing them multiplies the error.
+
+Connections between meetings are surfaced separately, under **Related recordings**: earlier meetings that share distinctive terms with this one, found by term overlap rather than by a model, with the shared terms shown so you can judge the link yourself. Nothing is asserted — they are links, and you decide whether they matter.
 
 ## Why text sometimes changes as you watch
 
@@ -248,16 +282,18 @@ Layout:
 | `main.py` | CLI, rendering the engine's event stream |
 | `doctor.py` | Audio setup diagnostics |
 | `library.py` | Listing, reading, renaming and deleting transcripts |
+| `summarizer.py` | Local-LLM summaries via Ollama, with grounding prompts |
+| `related.py` | Earlier recordings sharing distinctive terms — no LLM |
 | `web/server.py` | Loopback web UI — FastAPI + SSE over the same event bus |
 | `web/static/index.html` | The whole front end: no build step, no dependencies |
 
-`session.py` is the headless core: it prints nothing and publishes `state`, `segments`, `levels`, `notice`, `session` and `summary` events. The CLI is one consumer of that stream.
+`session.py` is the headless core: it prints nothing and publishes `state`, `segments`, `revise`, `levels`, `notice`, `session`, `summary` and `notes` events. The CLI is one consumer of that stream.
 
 ## Privacy
 
 Transcripts are verbatim records of conversations, often including things people did not expect to be written down.
 
-- Recording does not stop when the meeting does. Press Ctrl+C when the call ends.
+- Recording does not stop when the meeting does. Press **Stop** in the web UI, or Ctrl+C in the terminal, as soon as the call ends — otherwise whatever is said next is transcribed too.
 - If your output directory sits in a synced folder (iCloud, Dropbox, Obsidian Sync), transcripts leave your machine.
 - Recording other people may require their consent where you are.
 

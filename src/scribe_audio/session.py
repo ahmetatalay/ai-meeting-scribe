@@ -21,6 +21,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -72,6 +73,13 @@ class SessionConfig:
     use_speakers: bool = True
     keep_filler: bool = False
     level_interval: float = 0.5
+    # Automatic refresh is off by default. A 14B model costs around 20GB
+    # resident and seconds of CPU per pass; refreshing every few seconds kept
+    # it loaded permanently and drove a 48GB machine 23GB into swap. The
+    # summary is refreshed when asked for instead. Set a positive interval to
+    # turn automatic refresh back on.
+    notes_interval: float = 0.0
+    notes_min_new_words: int = 40
 
     def __post_init__(self):
         if self.mic_device is None and self.system_device is None:
@@ -165,6 +173,7 @@ class RecordingSession:
         capture_factory: Callable[[SessionConfig], DualStreamCapture] | None = None,
         transcriber_factory: Callable[[SessionConfig], Any] | None = None,
         writer_factory: Callable[[SessionConfig], TranscriptWriter] | None = None,
+        summarizer: Any = None,
     ):
         self.config = config
         self.bus = EventBus()
@@ -194,6 +203,16 @@ class RecordingSession:
         # Words of the last written batch, aligned against each new window to
         # decide whether that batch can be replaced wholesale.
         self._batch_words: list[str] = []
+
+        # Running summary, maintained on a background thread so it survives a
+        # browser reload and is part of the recording rather than of a tab.
+        self.summarizer = summarizer
+        self.notes: str | None = None
+        self.notes_model: str | None = None
+        self._notes_thread: threading.Thread | None = None
+        self._notes_covered_words = 0
+        self._notes_error: str | None = None
+        self.notes_latency = 0.0
         self._reported_stalls: set[str] = set()
         self._silent_windows = 0
         self._warned_silent = False
@@ -292,6 +311,7 @@ class RecordingSession:
                 return
 
             self.capture.start()
+            self._start_notes_worker()
             self._set_state(
                 STATE_RECORDING,
                 speakers=self.use_speakers,
@@ -310,6 +330,101 @@ class RecordingSession:
         finally:
             self._shutdown()
             self._finished.set()
+
+    # ------------------------------------------------------- running summary
+
+    def _start_notes_worker(self) -> None:
+        if self.summarizer is None or self.config.notes_interval <= 0:
+            return
+        self._notes_thread = threading.Thread(
+            target=self._notes_loop, name="scribe-notes", daemon=True
+        )
+        self._notes_thread.start()
+
+    def _transcript_words(self) -> list[str]:
+        if self.writer is None:
+            return []
+        return [
+            word
+            for seg in self.writer.segments
+            for word in f"{seg['speaker']}: {seg['text']}".split()
+        ]
+
+    def _notes_loop(self) -> None:
+        """Refresh the running summary while there is new speech to fold in.
+
+        The wait adapts to how long a pass actually took. A refine call on a
+        busy machine can exceed the nominal interval, and firing again
+        immediately would queue passes behind each other and fall further
+        behind for the rest of the meeting.
+        """
+        delay = self.config.notes_interval
+        while not self._stop_requested.wait(delay):
+            started = time.monotonic()
+            try:
+                self._refresh_notes()
+            except Exception as exc:  # never let this kill the recording
+                self._report_notes_error(exc)
+            elapsed = time.monotonic() - started
+            delay = max(self.config.notes_interval, elapsed * 1.5)
+            self.notes_latency = elapsed
+
+    def _refresh_notes(self) -> bool:
+        words = self._transcript_words()
+
+        # A tail revision can shorten the transcript; re-base rather than
+        # treating the shrinkage as new material.
+        if len(words) < self._notes_covered_words:
+            self._notes_covered_words = len(words)
+            return False
+
+        new_words = words[self._notes_covered_words:]
+        if len(new_words) < self.config.notes_min_new_words:
+            return False
+
+        summary = self.summarizer.refine(self.notes or "", " ".join(new_words))
+        self._notes_covered_words = len(words)
+        self.notes = summary.text
+        self.notes_model = summary.model
+        self._notes_error = None
+
+        self.bus.publish({
+            "type": "notes",
+            "text": summary.text,
+            "model": summary.model,
+            "covered_words": self._notes_covered_words,
+            "latency": round(self.notes_latency, 1),
+        })
+        return True
+
+    def refresh_notes_now(self) -> dict:
+        """Force a refresh, for the UI's Refresh button."""
+        if self.summarizer is None:
+            raise RuntimeError("no summarizer is configured")
+        # Ignore the usual minimum so an explicit request always does something
+        # when there is anything at all to fold in.
+        words = self._transcript_words()
+        if len(words) > self._notes_covered_words:
+            original = self.config.notes_min_new_words
+            self.config.notes_min_new_words = 1
+            try:
+                self._refresh_notes()
+            finally:
+                self.config.notes_min_new_words = original
+        return {"text": self.notes or "", "model": self.notes_model,
+                "covered_words": self._notes_covered_words}
+
+    def _report_notes_error(self, exc: Exception) -> None:
+        message = f"{type(exc).__name__}: {exc}"
+        if message == self._notes_error:
+            return  # report a persistent failure once, not every cycle
+        self._notes_error = message
+        self.bus.publish({
+            "type": "notice",
+            "level": "warning",
+            "code": "notes_failed",
+            "message": f"Live summary unavailable: {exc}",
+        })
 
     def _loop(self) -> None:
         assert self.capture is not None
@@ -356,6 +471,7 @@ class RecordingSession:
                 self.transcriber, "collapsed_count", 0
             )
 
+        self._persist_notes()
         self.bus.publish({
             "type": "summary",
             "stats": self.stats_dict(),
@@ -371,6 +487,25 @@ class RecordingSession:
             self._set_state(STATE_STOPPED)
         else:
             self._set_state(STATE_ERROR, error=self._error)
+
+    def _persist_notes(self) -> None:
+        """Keep the running summary with the recording once it stops."""
+        if not self.notes or self.writer is None or self.writer.path is None:
+            return
+        try:
+            from . import library
+
+            if library.get_summary(self.writer.path.parent, self.writer.path.name):
+                return  # a full summary already exists; do not overwrite it
+            library.set_summary(
+                self.writer.path.parent, self.writer.path.name,
+                {"text": self.notes, "model": self.notes_model or "unknown",
+                 "kind": "live", "passes": 1,
+                 "generated": datetime.now().isoformat(timespec="seconds")},
+            )
+        except Exception:
+            # Losing the running summary must never fail the recording.
+            pass
 
     # ---------------------------------------------------------- window handling
 

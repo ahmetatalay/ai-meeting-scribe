@@ -33,14 +33,22 @@ import json
 import queue
 import secrets
 import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from .. import library
+from .. import library, related
 from ..capture import find_device, get_system_audio, list_devices
 from ..session import RecordingSession, SessionConfig
+from ..summarizer import (
+    DEFAULT_MODEL,
+    OllamaSummarizer,
+    SummarizerError,
+    transcript_for_model,
+)
 
 HOST = "127.0.0.1"  # never configurable; see the module docstring
 DEFAULT_PORT = 8765
@@ -52,16 +60,52 @@ ALLOWED_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
 
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# How long an idle event stream waits between keep-alive comments.
+IDLE_KEEPALIVE_SECONDS = 15
+
+# How long a summariser availability answer is reused. Every check reaches the
+# model server, and the browser asks on each state change and view switch; with
+# two tabs open that was a steady trickle of requests to answer a question
+# whose answer is "is a local model server installed", which does not change
+# second to second.
+SUMMARIZER_STATUS_TTL = 30.0
+
 
 class AppState:
     """Process-wide state: the token, the current session, and defaults."""
 
-    def __init__(self, raw_dir: str | Path, default_model: str = "small"):
+    def __init__(self, raw_dir: str | Path, default_model: str = "small",
+                 summary_model: str = DEFAULT_MODEL,
+                 notes_model: str | None = None, auto_notes: float = 0.0):
         self.token = secrets.token_urlsafe(32)
         self.raw_dir = Path(raw_dir).expanduser()
         self.default_model = default_model
+        self.summary_model = summary_model
+        # The live panel and the final write-up want different things: the
+        # panel needs to keep up with the meeting, the write-up needs quality.
+        # Measured on qwen2.5:14b a refine pass runs 13-19s, which is marginal
+        # for a 12s cadence, so the two are separately selectable.
+        self.notes_model = notes_model or summary_model
+        self.auto_notes = auto_notes
+        self.summarizer_factory = lambda: OllamaSummarizer(model=self.summary_model)
+        self.notes_summarizer_factory = lambda: OllamaSummarizer(
+            model=self.notes_model
+        )
         self.session: RecordingSession | None = None
         self.lock = threading.Lock()
+        self._status_cache: dict | None = None
+        self._status_checked_at = 0.0
+
+    def summarizer_status(self, now: float | None = None) -> dict:
+        """Whether summarisation is available, reusing a recent answer."""
+        moment = time.monotonic() if now is None else now
+        if (self._status_cache is not None
+                and moment - self._status_checked_at < SUMMARIZER_STATUS_TTL):
+            return self._status_cache
+        status = self.summarizer_factory().status()
+        self._status_cache = status
+        self._status_checked_at = moment
+        return status
 
     def active_session(self) -> RecordingSession | None:
         with self.lock:
@@ -81,7 +125,18 @@ def _hostname_of(host_header: str) -> str:
 
 
 def create_app(state: AppState) -> FastAPI:
-    app = FastAPI(title="scribe", docs_url=None, redoc_url=None, openapi_url=None)
+    # An SSE response never finishes on its own, and uvicorn's graceful
+    # shutdown waits for in-flight requests — so without this the server could
+    # not be stopped while a browser tab was connected.
+    shutting_down = asyncio.Event()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        shutting_down.set()
+
+    app = FastAPI(title="scribe", docs_url=None, redoc_url=None,
+                  openapi_url=None, lifespan=lifespan)
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -234,11 +289,18 @@ def create_app(state: AppState) -> FastAPI:
                 raw_dir=state.raw_dir,
                 title=body.get("title") or None,
                 use_speakers=bool(body.get("use_speakers", True)),
+                notes_interval=state.auto_notes,
             )
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        session = RecordingSession(config)
+        summarizer = state.notes_summarizer_factory()
+        session = RecordingSession(
+            config,
+            # Only attach it if it can actually run, so a missing Ollama does
+            # not spawn a worker that fails every cycle.
+            summarizer=summarizer if summarizer.status().get("available") else None,
+        )
         with state.lock:
             state.session = session
         session.start()
@@ -319,13 +381,75 @@ def create_app(state: AppState) -> FastAPI:
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="no such transcript") from exc
 
+    # ----------------------------------------------------------- summaries
+
+    @app.get("/api/summarizer")
+    async def summarizer_status(token: str = Query("")) -> dict:
+        require_token(token)
+        # Reaches the model server over the network, so off the event loop.
+        return await asyncio.to_thread(state.summarizer_status)
+
+    @app.post("/api/summarize")
+    async def summarize_live(request: Request) -> dict:
+        """Summarise the recording in progress.
+
+        Only decisions, action items and open questions: a prose paragraph is
+        not what anyone reads mid-call.
+        """
+        session = state.active_session() or state.session
+        if session is None or session.writer is None:
+            raise HTTPException(status_code=409, detail="nothing has been recorded yet")
+        if session.summarizer is None:
+            raise HTTPException(
+                status_code=503,
+                detail=state.summarizer_factory().status().get(
+                    "detail", "summarisation is unavailable"
+                ),
+            )
+        try:
+            return await asyncio.to_thread(session.refresh_notes_now)
+        except SummarizerError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post("/api/transcripts/{name}/summary")
+    async def summarize_transcript(name: str) -> dict:
+        try:
+            entry = library.read(state.raw_dir, name)
+        except library.LibraryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="no such transcript") from exc
+
+        text = transcript_for_model(entry["turns"])
+        try:
+            summary = await asyncio.to_thread(
+                state.summarizer_factory().summarize, text, "full"
+            )
+        except SummarizerError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        return library.set_summary(state.raw_dir, name, summary.as_dict())
+
+    @app.get("/api/transcripts/{name}/related")
+    async def related_transcripts(name: str, token: str = Query("")) -> dict:
+        require_token(token)
+        try:
+            found = related.find(state.raw_dir, name)
+        except library.LibraryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="no such transcript") from exc
+        # Links for the reader to judge, never context fed to a model on its
+        # own: see scribe_audio.related.
+        return {"related": found}
+
     @app.get("/api/events")
     async def events(token: str = Query("")) -> StreamingResponse:
         # EventSource cannot set headers, so the token arrives as a query
         # parameter. The URL never leaves this machine.
         require_token(token)
         return StreamingResponse(
-            _event_stream(state),
+            _event_stream(state, shutting_down),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-store",
@@ -348,7 +472,7 @@ def _as_language(value) -> str | None:
     return str(value)
 
 
-async def _event_stream(state: AppState):
+async def _event_stream(state: AppState, shutting_down: "asyncio.Event | None" = None):
     """Forward the active session's events to the browser as SSE.
 
     Resubscribes when a new session starts, so the page does not need to
@@ -360,6 +484,8 @@ async def _event_stream(state: AppState):
     yield _sse({"type": "hello"})
     try:
         while True:
+            if shutting_down is not None and shutting_down.is_set():
+                return
             session = state.session
             if session is not subscribed:
                 if subscribed is not None and q is not None:
@@ -369,7 +495,14 @@ async def _event_stream(state: AppState):
                     q = session.bus.subscribe(replay=True)
 
             if q is None:
-                await asyncio.sleep(0.2)
+                # Nothing to report; keep the connection warm without
+                # chattering at it several times a second.
+                for _ in range(IDLE_KEEPALIVE_SECONDS * 5):
+                    if shutting_down is not None and shutting_down.is_set():
+                        return
+                    if state.session is not None:
+                        break
+                    await asyncio.sleep(0.2)
                 yield ": keep-alive\n\n"
                 continue
 
@@ -389,17 +522,49 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def port_is_free(port: int) -> bool:
+    """Whether the UI's port can be bound right now.
+
+    Checked before starting, because a second instance that merely fails to
+    bind can linger — several accumulated during development, holding nothing
+    and burning CPU — and because "already running" deserves a better message
+    than a PortAudio-adjacent traceback.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((HOST, port))
+        except OSError:
+            return False
+    return True
+
+
 def serve(raw_dir: str | Path, port: int = DEFAULT_PORT,
-          model: str = "small", open_browser: bool = True) -> None:
+          model: str = "small", summary_model: str = DEFAULT_MODEL,
+          notes_model: str | None = None, auto_notes: float = 0.0,
+          open_browser: bool = True) -> None:
     """Run the local web UI. Binds loopback only."""
     import uvicorn
 
-    state = AppState(raw_dir=raw_dir, default_model=model)
+    if not port_is_free(port):
+        print(f"[web] Port {port} is already in use.")
+        print(f"       scribe may already be running — try http://{HOST}:{port}/")
+        print(f"       Otherwise pick another port with --port.")
+        raise SystemExit(1)
+
+    state = AppState(raw_dir=raw_dir, default_model=model,
+                     summary_model=summary_model, notes_model=notes_model,
+                     auto_notes=auto_notes)
     app = create_app(state)
     url = f"http://{HOST}:{port}/"
 
     print(f"[web] scribe UI on {url}")
     print(f"[web] Transcripts: {state.raw_dir}")
+    print(f"[web] Summaries: {state.summary_model}"
+          + (f" (live: {state.notes_model})"
+             if state.notes_model != state.summary_model else ""))
     print("[web] Loopback only — not reachable from other machines.")
     print("[web] Ctrl+C to stop.\n")
 

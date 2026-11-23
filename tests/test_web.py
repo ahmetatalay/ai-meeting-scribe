@@ -483,3 +483,252 @@ class TestPayloadCoercion:
         assert _as_language("auto") is None
         assert _as_language("") is None
         assert _as_language("tr") == "tr"
+
+
+class TestSummaryRoutes:
+    """Summarisation runs on a local model, so these routes must degrade
+    clearly when it is not installed rather than hanging or 500ing."""
+
+    @pytest.fixture
+    def summarizing(self, tmp_path):
+        import json as _json
+
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        name = "transcript_2026-11-23_1000.md"
+        turns = "\n".join(
+            f"**{'You' if i % 2 else 'Meeting'}**: point number {i} about the migration"
+            for i in range(30)
+        )
+        (raw / name).write_text(
+            f"---\ntitle: Migration\nstarted: 2026-11-23T10:00:00\n---\n\n"
+            f"# Migration\n\n{turns}\n",
+            encoding="utf-8",
+        )
+        (raw / name).with_suffix(".json").write_text(
+            _json.dumps({"title": "Migration", "markdown": name, "segments": []}),
+            encoding="utf-8",
+        )
+
+        st = AppState(raw_dir=raw)
+        client = TestClient(create_app(st), base_url="http://127.0.0.1:8765")
+        return client, st, raw, name
+
+    def _fake_summarizer(self, st, reply="## Summary\nIt went fine."):
+        from scribe_audio.summarizer import OllamaSummarizer
+
+        st.summarizer_factory = lambda: OllamaSummarizer(
+            model="fake-model", transport=lambda m, p: reply
+        )
+
+    def _dead_summarizer(self, st):
+        """Point at a port nothing listens on.
+
+        Asserting "Ollama is absent" against the real machine makes the test
+        pass or fail depending on whether the developer happens to have it
+        running.
+        """
+        from scribe_audio.summarizer import OllamaSummarizer
+
+        st.summarizer_factory = lambda: OllamaSummarizer(
+            base_url="http://127.0.0.1:1"
+        )
+
+    def test_status_reports_unavailable_without_ollama(self, summarizing):
+        client, st, _, _ = summarizing
+        self._dead_summarizer(st)
+        data = client.get(f"/api/summarizer?token={st.token}").json()
+        assert data["available"] is False
+        assert "ollama" in data["hint"].lower()
+
+    def test_status_requires_the_token(self, summarizing):
+        client, _, _, _ = summarizing
+        assert client.get("/api/summarizer").status_code == 403
+
+    def test_repeated_status_checks_do_not_each_reach_the_model_server(
+        self, summarizing
+    ):
+        """The browser asks on every state change and view switch, and each
+        tab asks separately. Observed as a steady trickle of requests in the
+        model server's access log while nothing was being summarised."""
+        client, st, _, _ = summarizing
+        calls = []
+
+        class Counting:
+            def status(self):
+                calls.append(1)
+                return {"available": True, "detail": "fake"}
+
+        st.summarizer_factory = Counting
+        for _ in range(10):
+            assert client.get(f"/api/summarizer?token={st.token}").json()[
+                "available"] is True
+        assert len(calls) == 1, f"reached the model server {len(calls)} times"
+
+    def test_a_stale_status_is_eventually_rechecked(self, summarizing):
+        """Otherwise starting Ollama with the page already open would leave the
+        summarise buttons disabled until a reload."""
+        from scribe_audio.web.server import SUMMARIZER_STATUS_TTL
+
+        _, st, _, _ = summarizing
+        answers = iter([
+            {"available": False, "detail": "not reachable"},
+            {"available": True, "detail": "ready"},
+        ])
+
+        class Changing:
+            def status(self):
+                return next(answers)
+
+        st.summarizer_factory = Changing
+        assert st.summarizer_status(now=0.0)["available"] is False
+        assert st.summarizer_status(now=1.0)["available"] is False
+        assert st.summarizer_status(
+            now=SUMMARIZER_STATUS_TTL + 1.0)["available"] is True
+
+    def test_the_cache_window_is_short_enough_to_notice_a_change(self):
+        from scribe_audio.web.server import SUMMARIZER_STATUS_TTL
+
+        assert 5.0 <= SUMMARIZER_STATUS_TTL <= 120.0
+
+    def test_summarising_a_transcript_stores_the_result(self, summarizing):
+        client, st, raw, name = summarizing
+        self._fake_summarizer(st)
+
+        res = client.post(f"/api/transcripts/{name}/summary",
+                          headers={"X-Scribe-Token": st.token})
+        assert res.status_code == 200
+        assert "It went fine" in res.json()["text"]
+
+        import json as _json
+        data = _json.loads((raw / name).with_suffix(".json").read_text(encoding="utf-8"))
+        assert "It went fine" in data["summary"]["text"]
+
+    def test_a_stored_summary_comes_back_with_the_transcript(self, summarizing):
+        client, st, _, name = summarizing
+        self._fake_summarizer(st)
+        client.post(f"/api/transcripts/{name}/summary",
+                    headers={"X-Scribe-Token": st.token})
+
+        entry = client.get(f"/api/transcripts/{name}?token={st.token}").json()
+        assert "It went fine" in entry["summary"]["text"]
+
+    def test_the_listing_marks_summarised_recordings(self, summarizing):
+        client, st, _, name = summarizing
+        before = client.get(f"/api/transcripts?token={st.token}").json()
+        assert before["transcripts"][0]["has_summary"] is False
+
+        self._fake_summarizer(st)
+        client.post(f"/api/transcripts/{name}/summary",
+                    headers={"X-Scribe-Token": st.token})
+
+        after = client.get(f"/api/transcripts?token={st.token}").json()
+        assert after["transcripts"][0]["has_summary"] is True
+
+    def test_summarising_requires_the_token(self, summarizing):
+        client, st, _, name = summarizing
+        self._fake_summarizer(st)
+        assert client.post(f"/api/transcripts/{name}/summary").status_code == 403
+
+    def test_summarising_refuses_traversal(self, summarizing):
+        client, st, _, _ = summarizing
+        self._fake_summarizer(st)
+        res = client.post("/api/transcripts/..%2Foutside.md/summary",
+                          headers={"X-Scribe-Token": st.token})
+        assert res.status_code in (400, 404)
+
+    def test_an_unavailable_model_is_reported_as_503(self, summarizing):
+        client, st, _, name = summarizing
+        self._dead_summarizer(st)
+        res = client.post(f"/api/transcripts/{name}/summary",
+                          headers={"X-Scribe-Token": st.token})
+        assert res.status_code == 503
+        assert "ollama" in res.json()["detail"].lower()
+
+    def test_live_summary_without_a_session_is_a_conflict(self, summarizing):
+        client, st, _, _ = summarizing
+        self._fake_summarizer(st)
+        res = client.post("/api/summarize", headers={"X-Scribe-Token": st.token})
+        assert res.status_code == 409
+
+    def test_related_recordings_route(self, summarizing):
+        client, st, raw, name = summarizing
+        # A second recording about the same thing.
+        other = "transcript_2026-11-22_0900.md"
+        (raw / other).write_text(
+            "---\ntitle: Earlier\nstarted: 2026-11-22T09:00:00\n---\n\n"
+            "# Earlier\n\n"
+            + "\n".join(f"**You**: migration point {i}" for i in range(30)) + "\n",
+            encoding="utf-8",
+        )
+
+        data = client.get(f"/api/transcripts/{name}/related?token={st.token}").json()
+        assert isinstance(data["related"], list)
+
+    def test_related_requires_the_token(self, summarizing):
+        client, _, _, name = summarizing
+        assert client.get(f"/api/transcripts/{name}/related").status_code == 403
+
+
+class TestInstanceHygiene:
+    """Several `scribe web` processes accumulated during development: each
+    lingered instead of exiting, and one held the port while the rest burned
+    CPU serving nothing."""
+
+    def test_a_taken_port_is_detected(self):
+        import socket
+
+        from scribe_audio.web.server import HOST, port_is_free
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            held.bind((HOST, 0))
+            held.listen(1)
+            port = held.getsockname()[1]
+            assert port_is_free(port) is False
+
+        # Released again once the holder closes.
+        assert port_is_free(port) is True
+
+    def test_serving_on_a_taken_port_exits_instead_of_lingering(self, tmp_path):
+        import socket
+
+        import pytest as _pytest
+
+        from scribe_audio.web.server import HOST, serve
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            held.bind((HOST, 0))
+            held.listen(1)
+            port = held.getsockname()[1]
+
+            with _pytest.raises(SystemExit) as exit_info:
+                serve(raw_dir=tmp_path, port=port, open_browser=False)
+            assert exit_info.value.code == 1
+
+    def test_the_event_stream_ends_when_the_server_shuts_down(self, state):
+        """Without this, uvicorn's graceful shutdown waits forever on the SSE
+        response and the process cannot be stopped while a tab is open."""
+        import asyncio
+
+        from scribe_audio.web.server import _event_stream
+
+        async def drain_until_done():
+            shutting_down = asyncio.Event()
+            stream = _event_stream(state, shutting_down)
+            # The greeting arrives immediately.
+            assert "hello" in await stream.__anext__()
+            shutting_down.set()
+            with pytest.raises(StopAsyncIteration):
+                for _ in range(50):
+                    await stream.__anext__()
+
+        asyncio.run(asyncio.wait_for(drain_until_done(), timeout=10))
+
+    def test_idle_keepalives_are_not_chatty(self):
+        """They fired five times a second, which is what gave idle servers
+        measurable CPU time."""
+        from scribe_audio.web.server import IDLE_KEEPALIVE_SECONDS
+
+        assert IDLE_KEEPALIVE_SECONDS >= 10

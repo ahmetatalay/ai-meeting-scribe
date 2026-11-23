@@ -1,5 +1,101 @@
 # Changelog
 
+## 2.4.0 — 2026-11-23
+
+### Added
+
+- **AI summaries, locally.** A "Notes so far" panel above the live transcript
+  produces decisions, action items and open questions on demand; past
+  recordings get a Summarise button in the reader. Summaries run through
+  [Ollama](https://ollama.com) on the same machine, so transcripts still never
+  leave it. Stored in the JSON sidecar, and the library marks which recordings
+  have one.
+
+  The live summary is **incremental**: each refresh passes the model only the
+  speech since the last one plus the summary it already wrote, and asks for an
+  updated whole. Re-reading the entire transcript each time both churns the
+  text and gets steadily slower — measured on qwen2.5:14b, a from-scratch pass
+  grew from 5.0s to 15.3s within five cycles.
+
+  Refreshing is **on demand, not automatic**. An earlier build refreshed every
+  12 seconds; that kept the model permanently resident at ~21GB and drove a
+  48GB machine 23GB into swap. Automatic refresh is now opt-in via
+  `--auto-notes SECONDS`.
+
+  Two measured reductions to the model's footprint: an explicit `num_ctx` of
+  8192 (the compacted prompt needs a few thousand tokens, and a large window
+  only buys a large KV cache) took resident size from 21GB to 9.9GB, and a
+  60-second `keep_alive` releases it between summaries — 0GB a minute after a
+  press.
+
+  The prompt asks for **substance rather than topics**, after a recording of a
+  systems-design talk summarised as "Discussing handling large blobs (large
+  files like photos or videos)" — section headings restated as bullets, with
+  every mechanism and figure dropped. It now carries a worked bad/good
+  contrast, requires stated numbers to survive, and tells the model to use its
+  bullet budget rather than merging distinct mechanisms away. The same
+  recording now yields "The load balancer cuts the connection at 30 seconds,
+  so the API server queues the job and returns a job ID".
+
+  Empty sections are framed as the **expected** case. The same summary had
+  invented an action item, turning a speaker's "I am preparing for the
+  presentation today with <colleague>" into a task assigned to both of them —
+  current activity rather than a commitment, and the colleague had never been
+  assigned anything. With Decisions and Open questions genuinely empty, the
+  model filled the one section it could. An action item now requires a
+  commitment to work not yet done.
+
+### Fixed
+
+- A summariser availability check reached the model server on every UI state
+  change and view switch, in every open tab; the answer is now reused for 30
+  seconds on both sides, and the check runs off the event loop.
+
+  The summary size is bounded **in code**, not asked for in the prompt: a
+  running summary instructed to stay under 250 words reached 555 after nine
+  passes, with latency growing from 15s to 27s alongside it. Each section's
+  bullets and the prose section's sentences are now trimmed before the summary
+  is fed back, so the input to every pass stays bounded however long the
+  meeting runs.
+
+  It runs on the server rather than in the browser, so it survives a reload,
+  and is stored with the recording on stop. Output is English whatever language
+  the meeting is in.
+
+- `--notes-model` to run the live panel on a smaller, faster model than the
+  final write-up.
+
+  Prompts actively suppress invention: the model is told to use only what the
+  transcript states, to write "None" for empty sections, that the text is
+  machine-generated and contains misheard words, and that the speaker labels
+  come from audio channels rather than voice recognition and are occasionally
+  wrong. Transcripts longer than one pass are summarised in parts and merged
+  rather than truncated.
+
+  When Ollama is not installed the UI says so with the command to fix it, and
+  the button stays disabled instead of failing mid-request.
+
+- **Related recordings.** Earlier meetings sharing distinctive terms with the
+  one being read, found by term overlap weighted by document frequency — no
+  model involved. The shared terms are shown so the link can be judged rather
+  than trusted. This is the deliberate alternative to feeding several
+  transcripts to a model, which invents cross-references.
+
+- `scribe web --summary-model` to choose the Ollama model (default
+  `qwen2.5:14b`).
+
+### Fixed
+
+- **`scribe web` could not be stopped while a browser tab was open.** The SSE
+  response never completes, and uvicorn's graceful shutdown waits for in-flight
+  requests, so the process lingered — several accumulated during development,
+  suspended in the background, holding ports and burning CPU. The stream now
+  ends on shutdown.
+- Idle event streams sent a keep-alive five times a second, which is what gave
+  idle servers measurable CPU time. Now every 15 seconds.
+- Starting `scribe web` on a port already in use now says so and exits,
+  instead of lingering as a process that serves nothing.
+
 ## 2.3.0 — 2026-11-23
 
 ### Changed

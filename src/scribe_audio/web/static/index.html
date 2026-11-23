@@ -191,6 +191,38 @@
   .empty { color: var(--muted); font-size: 14px; text-align: center; padding: 70px 20px; }
   .empty code { font-family: var(--mono); font-size: 12px; }
 
+  /* Summary panels */
+  #notes, #summary-box { margin-bottom: 18px; }
+  #notes h2, #summary-box h2 {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  }
+  #notes h2 .spacer, #summary-box h2 .spacer { flex: 1; }
+  .md { font-size: 14px; line-height: 1.6; }
+  .md h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin: 14px 0 5px; font-weight: 600;
+  }
+  .md h2:first-child { margin-top: 0; }
+  .md ul { margin: 0; padding-left: 20px; }
+  .md li { margin: 2px 0; }
+  .md p { margin: 0 0 8px; }
+  .stamp { font-size: 11px; color: var(--muted); font-weight: 400; }
+  .busy { color: var(--muted); font-size: 13px; }
+
+  /* Related recordings */
+  #related { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  #related h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin: 0 0 7px; font-weight: 600;
+  }
+  .rel {
+    display: flex; gap: 8px; align-items: baseline; font-size: 13px;
+    padding: 4px 0; cursor: pointer;
+  }
+  .rel:hover .rel-t { color: var(--accent); }
+  .rel-t { font-weight: 500; }
+  .rel-terms { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+
   /* Tabs */
   .tabs { display: flex; gap: 4px; }
   .tab {
@@ -323,6 +355,17 @@
 
   <div>
     <div id="notices"></div>
+
+    <div class="panel" id="notes" hidden>
+      <h2>
+        Notes so far
+        <span class="spacer"></span>
+        <span class="stamp" id="notes-stamp"></span>
+        <button class="icon" id="notes-refresh">Refresh</button>
+      </h2>
+      <div class="md" id="notes-body"></div>
+    </div>
+
     <div class="panel" id="transcript">
       <h2 style="display:flex;align-items:center;gap:10px">
         Transcript
@@ -352,6 +395,21 @@
         <button class="icon" id="reader-back">← Back</button>
       </div>
       <div id="reader-meta"></div>
+
+      <div class="panel" id="summary-box" hidden>
+        <h2>
+          Summary
+          <span class="spacer"></span>
+          <span class="stamp" id="summary-stamp"></span>
+          <button class="icon" id="summary-make">Summarise</button>
+        </h2>
+        <div class="md" id="summary-body"></div>
+        <div id="related" hidden>
+          <h3>Related recordings</h3>
+          <div id="related-list"></div>
+        </div>
+      </div>
+
       <div id="reader-body"></div>
     </div>
 
@@ -587,6 +645,20 @@ function setState(value) {
     validateSelection();
   }
 
+  if (recording) {
+    checkSummarizer().then(st => {
+      notesAvailable = st.available;
+      $("notes").hidden = !st.available || view !== "record";
+      $("notes-refresh").disabled = !st.available;
+      if (st.available && !$("notes-body").textContent) {
+        $("notes-body").className = "md busy";
+        $("notes-body").textContent =
+          "Press Refresh to summarise what has been said so far. Each press " +
+          "reads only the new speech and folds it into the summary.";
+      }
+    });
+  }
+
   if (recording && !timer) {
     startedAt = Date.now();
     timer = setInterval(tick, 1000);
@@ -611,6 +683,7 @@ function connect() {
     if (ev.type === "levels") renderLevels(ev);
     else if (ev.type === "segments") addSegments(ev.segments);
     else if (ev.type === "revise") reviseSegments(ev.from_id, ev.segments);
+    else if (ev.type === "notes") showNotes(ev);
     else if (ev.type === "state") setState(ev.value);
     else if (ev.type === "notice") addNotice(ev);
     else if (ev.type === "session" && ev.markdown) {
@@ -637,6 +710,8 @@ function setView(next) {
   $("tab-library").classList.toggle("on", next !== "record");
 
   $("transcript").hidden = next !== "record";
+  $("notes").hidden = next !== "record"
+    || !(notesAvailable || $("notes-body").textContent);
   $("meta").hidden = next !== "record" || !$("f-path").textContent;
   $("library").hidden = next !== "library";
   $("reader").hidden = next !== "reader";
@@ -690,6 +765,7 @@ async function loadLibrary() {
     const who = Object.entries(t.speakers || {})
       .map(([k, v]) => `${k} ${v}`).join(", ");
     if (who) bits.push(who);
+    if (t.has_summary) bits.push("summarised");
 
     const row = document.createElement("div");
     row.className = "item";
@@ -739,6 +815,20 @@ async function openTranscript(name) {
   if (data.model) bits.push(data.model);
   $("reader-meta").textContent = bits.join(" · ") + " — " + data.relative_path;
 
+  readerName = name;
+  $("summary-box").hidden = false;
+  showSummary(data.summary);
+  // checkSummarizer caches, so this is cheap; unlike a permanent cache it also
+  // notices a model server started after the page was loaded.
+  const st = await checkSummarizer();
+  $("summary-make").disabled = !st.available;
+  $("summary-make").title = st.available ? "" : summarizerUnavailableMessage(st);
+  if (!data.summary && !st.available) {
+    $("summary-body").className = "md busy";
+    $("summary-body").textContent = summarizerUnavailableMessage(st);
+  }
+  loadRelated(name);
+
   const body = $("reader-body");
   body.innerHTML = "";
   let last = null;
@@ -783,7 +873,173 @@ async function deleteTranscript(t) {
   }
 }
 
+/* --------------------------------------------------------------- summaries */
+
+// Minimal markdown: headings, bullets, checkboxes. Built with textContent so
+// model output is never interpolated as HTML.
+function renderMarkdown(target, md) {
+  target.innerHTML = "";
+  let list = null;
+  for (const raw of (md || "").split("\n")) {
+    const line = raw.trim();
+    if (!line) { list = null; continue; }
+
+    if (line.startsWith("#")) {
+      const h = document.createElement("h2");
+      h.textContent = line.replace(/^#+\s*/, "");
+      target.append(h);
+      list = null;
+    } else if (/^[-*]\s/.test(line)) {
+      if (!list) { list = document.createElement("ul"); target.append(list); }
+      const li = document.createElement("li");
+      li.textContent = line.replace(/^[-*]\s*/, "").replace(/^\[[ xX]\]\s*/, "");
+      if (/^\[[ xX]\]/.test(line.replace(/^[-*]\s*/, ""))) {
+        li.textContent = "☐ " + li.textContent;
+      }
+      list.append(li);
+    } else {
+      const p = document.createElement("p");
+      p.textContent = line;
+      target.append(p);
+      list = null;
+    }
+  }
+}
+
+let summarizerStatus = null;
+// Whether the live notes panel should be on screen at all: true once a
+// recording starts with a working summariser, and kept true afterwards so the
+// notes stay readable when the recording stops.
+let notesAvailable = false;
+
+// Each status check reaches Ollama, so repeated calls are not free. Callers ask
+// freely — on every state change, on every view switch — so the answer is held
+// briefly and concurrent callers share one request. Whether a local model
+// server is installed does not change second to second.
+const SUMMARIZER_STATUS_TTL_MS = 30000;
+let summarizerCheckedAt = 0;
+let summarizerInFlight = null;
+
+async function checkSummarizer() {
+  if (summarizerStatus &&
+      Date.now() - summarizerCheckedAt < SUMMARIZER_STATUS_TTL_MS) {
+    return summarizerStatus;
+  }
+  if (summarizerInFlight) return summarizerInFlight;
+
+  summarizerInFlight = (async () => {
+    try {
+      summarizerStatus = await api("/api/summarizer");
+    } catch (_) {
+      summarizerStatus = { available: false, detail: "status unavailable" };
+    }
+    summarizerCheckedAt = Date.now();
+    return summarizerStatus;
+  })().finally(() => { summarizerInFlight = null; });
+
+  return summarizerInFlight;
+}
+
+function summarizerUnavailableMessage(st) {
+  return (st.detail || "Summarisation is unavailable")
+    + (st.hint ? ` — run: ${st.hint}` : "");
+}
+
+function showNotes(ev) {
+  notesAvailable = true;
+  if (view === "record") $("notes").hidden = false;
+  $("notes-body").className = "md";
+  renderMarkdown($("notes-body"), ev.text);
+  const bits = [ev.model].filter(Boolean);
+  if (ev.covered_words) bits.push(`${ev.covered_words} words read`);
+  // Surfacing the pass time makes it obvious when a bigger model cannot keep
+  // up with the meeting, rather than leaving the panel mysteriously stale.
+  if (ev.latency) bits.push(`${ev.latency}s`);
+  $("notes-stamp").textContent = bits.join(" · ");
+}
+
+// Summarising is on demand: a 14B model costs ~20GB resident and seconds of
+// CPU per pass, so it runs when asked rather than on a timer.
+async function refreshNotes() {
+  const btn = $("notes-refresh");
+  const was = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Summarising…";
+  try {
+    const notes = await api("/api/summarize", { method: "POST" });
+    if (notes.text) showNotes(notes);
+  } catch (err) {
+    addNotice({ level: "warning", message: err.message });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = was;
+  }
+}
+
+let readerName = null;
+
+function showSummary(summary) {
+  if (summary && summary.text) {
+    renderMarkdown($("summary-body"), summary.text);
+    $("summary-stamp").textContent =
+      `${summary.model} · ${whenLabel(summary.generated)}`;
+  } else {
+    $("summary-body").className = "md busy";
+    $("summary-body").textContent = "No summary yet.";
+    $("summary-stamp").textContent = "";
+  }
+}
+
+async function makeSummary() {
+  if (!readerName) return;
+  const btn = $("summary-make");
+  btn.disabled = true;
+  $("summary-body").className = "md busy";
+  $("summary-body").textContent = "Summarising locally… this can take a minute.";
+  try {
+    const summary = await api(
+      `/api/transcripts/${encodeURIComponent(readerName)}/summary`,
+      { method: "POST" }
+    );
+    $("summary-body").className = "md";
+    showSummary(summary);
+    loadLibrary();
+  } catch (err) {
+    $("summary-body").className = "md busy";
+    $("summary-body").textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function loadRelated(name) {
+  $("related").hidden = true;
+  let found;
+  try {
+    found = (await api(`/api/transcripts/${encodeURIComponent(name)}/related`)).related;
+  } catch (_) {
+    return;
+  }
+  if (!found.length) return;
+
+  $("related-list").innerHTML = "";
+  for (const r of found) {
+    const row = document.createElement("div");
+    row.className = "rel";
+    row.innerHTML = '<span class="rel-t"></span><span class="rel-terms"></span>';
+    row.querySelector(".rel-t").textContent = r.title;
+    // Shared terms are shown so the link can be judged rather than trusted.
+    row.querySelector(".rel-terms").textContent = r.shared_terms.join(", ");
+    row.onclick = () => openTranscript(r.name);
+    $("related-list").append(row);
+  }
+  $("related").hidden = false;
+}
+
 /* ------------------------------------------------------------------ actions */
+
+$("notes-refresh").onclick = refreshNotes;
+$("summary-make").onclick = makeSummary;
 
 $("tab-record").onclick = () => setView("record");
 $("tab-library").onclick = () => setView("library");
@@ -815,6 +1071,8 @@ $("go").onclick = async () => {
       $("turns").innerHTML = "";
       $("notices").innerHTML = "";
       $("jump").hidden = true;
+      $("notes-body").textContent = "";
+      $("notes-stamp").textContent = "";
       lastSpeaker = null; sawMeeting = false;
       await api("/api/start", {
         method: "POST",

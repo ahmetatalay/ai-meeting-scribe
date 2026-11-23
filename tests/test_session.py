@@ -492,3 +492,210 @@ class TestTailRevision:
         written = session.writer.segments
         assert session.stats.segments == len(written)
         assert session.stats.words == sum(len(s["text"].split()) for s in written)
+
+
+class FakeSummarizer:
+    """Records refine calls and returns a growing canned summary."""
+
+    def __init__(self, fail_with=None, delay=0.0):
+        self.calls = []
+        self.fail_with = fail_with
+        self.delay = delay
+
+    def refine(self, existing, new_text):
+        import time as _time
+
+        from scribe_audio.summarizer import Summary
+
+        if self.delay:
+            _time.sleep(self.delay)
+        self.calls.append((existing, new_text))
+        if self.fail_with:
+            raise self.fail_with
+        return Summary(text=f"## Summary\nfolded {len(self.calls)} parts",
+                       model="fake-model", kind="live")
+
+
+class TestRunningSummary:
+    """The live summary is maintained on the server, so it survives a browser
+    reload and is part of the recording rather than of a tab.
+
+    The refresh logic is driven directly rather than through the worker thread:
+    the fake capture finishes in microseconds, so any timing-based test here
+    would be measuring the test harness.
+    """
+
+    def _recorded(self, tmp_path, script, summarizer, **cfg):
+        """Run a recording to completion, then hand back the session."""
+        from fakes import FakeCapture, ScriptedTranscriber
+
+        windows = [make_window("Meeting", seed=i * 10) for i in range(len(script))]
+        cfg.setdefault("notes_min_new_words", 1)
+        config = SessionConfig(
+            mic_device=1, system_device=2, raw_dir=tmp_path,
+            window=10.0, step=5.0, level_interval=0.01,
+            notes_interval=3600, **cfg,
+        )
+        session = RecordingSession(
+            config,
+            capture_factory=lambda c: FakeCapture(windows),
+            transcriber_factory=lambda c: ScriptedTranscriber(script),
+            summarizer=summarizer,
+        )
+        session.start()
+        assert session.wait(timeout=10)
+        return session
+
+    def test_a_refresh_publishes_the_summary(self, tmp_path):
+        fake = FakeSummarizer()
+        session = self._recorded(
+            tmp_path, ["something was said about the migration project"], fake,
+        )
+        q = session.bus.subscribe(replay=False)
+        assert session._refresh_notes() is True
+
+        notes = of_type(drain(q), "notes")
+        assert notes and "folded" in notes[0]["text"]
+        assert notes[0]["model"] == "fake-model"
+        assert notes[0]["covered_words"] > 0
+
+    def test_only_the_new_part_is_sent(self, tmp_path):
+        """Re-reading the whole transcript every  cycle is what makes the latency
+        grow until it cannot keep up with the meeting."""
+        fake = FakeSummarizer()
+        session = self._recorded(
+            tmp_path, ["the first thing that was said here"], fake,
+        )
+        session._refresh_notes()
+        first_sent = fake.calls[0][1]
+        assert "first thing" in first_sent
+
+        session.writer.append_segments(
+            [{"speaker": "You", "text": "a brand new sentence arrives later"}]
+        )
+        assert session._refresh_notes() is True
+        second_sent = fake.calls[1][1]
+        assert "brand new sentence" in second_sent
+        assert "first thing" not in second_sent
+
+    def test_the_previous_summary_is_passed_back_in(self, tmp_path):
+        """Continuity: the model must see what it already wrote."""
+        fake = FakeSummarizer()
+        session = self._recorded(tmp_path, ["an opening statement was made"], fake)
+        session._refresh_notes()
+
+        session.writer.append_segments(
+            [{"speaker": "You", "text": "and then something else entirely"}]
+        )
+        session._refresh_notes()
+        assert "folded" in fake.calls[1][0]
+
+    def test_nothing_new_means_no_call(self, tmp_path):
+        fake = FakeSummarizer()
+        session = self._recorded(tmp_path, ["something was said here"], fake)
+        assert session._refresh_notes() is True
+        assert session._refresh_notes() is False
+        assert len(fake.calls) == 1
+
+    def test_too_little_new_speech_is_skipped(self, tmp_path):
+        fake = FakeSummarizer()
+        session = self._recorded(
+            tmp_path, ["three words only"], fake, notes_min_new_words=500,
+        )
+        assert session._refresh_notes() is False
+        assert fake.calls == []
+
+    def test_a_shortened_transcript_is_rebased_not_resent(self, tmp_path):
+        """A tail revision can shorten the transcript; that is not new material."""
+        fake = FakeSummarizer()
+        session = self._recorded(tmp_path, ["something said"], fake)
+        session._notes_covered_words = 10_000
+
+        assert session._refresh_notes() is False
+        assert session._notes_covered_words < 10_000
+        assert fake.calls == []
+
+    def test_a_failing_summarizer_is_reported_once(self, tmp_path):
+        from scribe_audio.summarizer import SummarizerError
+
+        fake = FakeSummarizer(fail_with=SummarizerError("model unloaded"))
+        session = self._recorded(tmp_path, ["something was said here"], fake)
+        q = session.bus.subscribe(replay=False)
+
+        for _ in range(3):
+            try:
+                session._refresh_notes()
+            except SummarizerError as exc:
+                session._report_notes_error(exc)
+
+        failures = [e for e in of_type(drain(q), "notice")
+                    if e["code"] == "notes_failed"]
+        assert len(failures) == 1, "a broken summariser must not spam every cycle"
+
+    def test_a_failing_summarizer_does_not_harm_the_recording(self, tmp_path):
+        from scribe_audio.summarizer import SummarizerError
+
+        fake = FakeSummarizer(fail_with=SummarizerError("model unloaded"))
+        session = self._recorded(tmp_path, ["something was said here"], fake)
+        assert session.state == STATE_STOPPED
+        assert session.writer.path.exists()
+        assert "something was said" in session.writer.path.read_text(encoding="utf-8")
+
+    def test_no_summarizer_means_no_worker_and_no_notes(self, tmp_path):
+        session = self._recorded(tmp_path, ["something said"], None)
+        assert session.notes is None
+        assert session._notes_thread is None
+
+    def test_a_worker_thread_is_started_when_a_summarizer_is_present(self, tmp_path):
+        fake = FakeSummarizer()
+        session = self._recorded(tmp_path, ["something said"], fake)
+        assert session._notes_thread is not None
+
+    def test_the_running_summary_is_saved_with_the_recording(self, tmp_path):
+        import json
+
+        fake = FakeSummarizer()
+        session = self._recorded(
+            tmp_path, ["something was said about the project"], fake,
+        )
+        session._refresh_notes()
+        session._persist_notes()
+
+        data = json.loads(session.writer.sidecar_path.read_text(encoding="utf-8"))
+        assert "folded" in data["summary"]["text"]
+        assert data["summary"]["kind"] == "live"
+
+    def test_an_existing_full_summary_is_not_overwritten(self, tmp_path):
+        from scribe_audio import library
+
+        fake = FakeSummarizer()
+        session = self._recorded(tmp_path, ["something was said here"], fake)
+        library.set_summary(
+            tmp_path, session.writer.path.name,
+            {"text": "a careful full summary", "model": "m", "kind": "full"},
+        )
+        session._refresh_notes()
+        session._persist_notes()
+
+        stored = library.get_summary(tmp_path, session.writer.path.name)
+        assert stored["text"] == "a careful full summary"
+
+
+class TestAutomaticNotesAreOptIn:
+    """Refreshing every few seconds kept a 20GB model permanently resident."""
+
+    def test_no_worker_without_an_interval(self, tmp_path):
+        config = SessionConfig(mic_device=1, system_device=2, raw_dir=tmp_path)
+        assert config.notes_interval == 0.0
+
+        session = RecordingSession(config, summarizer=object())
+        session._start_notes_worker()
+        assert session._notes_thread is None
+
+    def test_a_positive_interval_turns_it_on(self, tmp_path):
+        config = SessionConfig(mic_device=1, system_device=2, raw_dir=tmp_path,
+                               notes_interval=3600)
+        session = RecordingSession(config, summarizer=object())
+        session._start_notes_worker()
+        assert session._notes_thread is not None
+        session._stop_requested.set()

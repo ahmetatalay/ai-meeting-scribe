@@ -202,6 +202,7 @@ def _render_summary(event: dict) -> None:
 def cmd_web(args) -> None:
     """Run the local web UI."""
     try:
+        from .summarizer import DEFAULT_MODEL as DEFAULT_SUMMARY_MODEL
         from .web.server import DEFAULT_PORT, serve
     except ImportError:
         print("[web] The web UI needs the 'web' extra:")
@@ -213,6 +214,9 @@ def cmd_web(args) -> None:
         raw_dir=args.raw or os.environ.get("SCRIBE_RAW_DIR", "./raw"),
         port=args.port or DEFAULT_PORT,
         model=args.model,
+        summary_model=args.summary_model or DEFAULT_SUMMARY_MODEL,
+        notes_model=args.notes_model,
+        auto_notes=args.auto_notes,
         open_browser=not args.no_browser,
     )
 
@@ -241,6 +245,16 @@ def main() -> None:
                      help="Output directory (default: $SCRIBE_RAW_DIR or ./raw)")
     web.add_argument("--model", "-m", default="small",
                      help="Default Whisper model offered in the UI")
+    web.add_argument("--summary-model", default=None,
+                     help="Ollama model for the final summary (default: qwen2.5:14b)")
+    web.add_argument("--auto-notes", type=float, default=0.0, metavar="SECONDS",
+                     help="Refresh the live summary automatically every N "
+                          "seconds (default: off — it runs when you press "
+                          "Refresh, since a large model costs ~20GB resident)")
+    web.add_argument("--notes-model", default=None,
+                     help="Ollama model for the live running summary "
+                          "(default: same as --summary-model; a smaller model "
+                          "keeps up better)")
     web.add_argument("--no-browser", action="store_true",
                      help="Do not open a browser window")
 
