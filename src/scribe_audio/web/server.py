@@ -38,6 +38,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from .. import library
 from ..capture import find_device, get_system_audio, list_devices
 from ..session import RecordingSession, SessionConfig
 
@@ -265,6 +266,58 @@ def create_app(state: AppState) -> FastAPI:
             raise HTTPException(status_code=409, detail="no session")
         session.set_title(title)
         return {"title": title}
+
+    # ------------------------------------------------------------- library
+
+    @app.get("/api/transcripts")
+    async def transcripts(token: str = Query(""), q: str = Query("")) -> dict:
+        require_token(token)
+        result = library.scan_detailed(state.raw_dir, q)
+        return {**result, "directory": str(state.raw_dir)}
+
+    @app.get("/api/transcripts/{name}")
+    async def transcript(name: str, token: str = Query("")) -> dict:
+        require_token(token)
+        try:
+            return library.read(state.raw_dir, name)
+        except library.LibraryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="no such transcript") from exc
+
+    @app.post("/api/transcripts/{name}/title")
+    async def rename_transcript(name: str, request: Request) -> dict:
+        body = await request.json()
+        try:
+            result = library.set_title(state.raw_dir, name, body.get("title") or "")
+        except library.LibraryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="no such transcript") from exc
+
+        # Keep an in-progress recording's own title in step.
+        session = state.active_session()
+        if session and session.writer and session.writer.path \
+                and session.writer.path.name == name:
+            session.writer.title = result["title"]
+        return result
+
+    @app.delete("/api/transcripts/{name}")
+    async def remove_transcript(name: str) -> dict:
+        # Never delete the file a recording is currently appending to.
+        session = state.active_session()
+        if session and session.writer and session.writer.path \
+                and session.writer.path.name == name:
+            raise HTTPException(
+                status_code=409,
+                detail="that recording is still in progress",
+            )
+        try:
+            return library.delete(state.raw_dir, name)
+        except library.LibraryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="no such transcript") from exc
 
     @app.get("/api/events")
     async def events(token: str = Query("")) -> StreamingResponse:

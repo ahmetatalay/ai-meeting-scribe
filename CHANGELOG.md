@@ -1,5 +1,40 @@
 # Changelog
 
+## 2.2.0 — 2026-11-23
+
+### Added
+
+- **Transcript library** in the web UI. A Library tab listing every recording
+  newest-first with title, date, duration, word count and speaker breakdown;
+  click to read, rename inline, or delete. Search covers both titles and
+  transcript bodies.
+- Recordings predating sidecars are listed too: the date comes from the
+  filename and the title from the document heading, so an older `raw/`
+  directory is readable without migration.
+- Renaming writes only the JSON sidecar, so the markdown is never rewritten.
+
+### Fixed
+
+- **The library listed any markdown file, with a Delete button next to it.**
+  Pointed at a project directory or an Obsidian vault it offered your notes as
+  recordings, one click from permanent deletion. Listing now requires positive
+  evidence that scribe produced the file — a sidecar, a `started` frontmatter
+  key, the transcript filename pattern, or a `# Transcript —` heading. Content
+  heuristics were not enough: this project's own README *contains* an example
+  transcript. The filter applies to reading and deleting as well, so a direct
+  URL cannot bypass it, and the UI reports how many files were ignored.
+- Recordings without a sidecar sorted by file mtime, so copying a directory
+  put old transcripts above new ones. The start time now comes from the
+  filename.
+
+### Security
+
+- The library routes take a filename from the request and read, rename and
+  delete files with it. Names are restricted to a bare filename pattern and
+  the resolved path must sit directly inside the output directory, so `../`,
+  absolute paths and symlinks pointing outside are all refused. Deleting the
+  recording currently in progress is refused.
+
 ## 2.1.0 — 2026-11-23
 
 ### Added

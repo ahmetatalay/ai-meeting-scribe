@@ -148,6 +148,7 @@
 
   /* The transcript is its own scroll region: the page itself must not move
      when new speech arrives, or reading anything becomes impossible. */
+  #library, #reader { max-height: calc(100vh - 150px); overflow-y: auto; }
   #transcript {
     position: relative;
     display: flex; flex-direction: column;
@@ -190,6 +191,53 @@
   .empty { color: var(--muted); font-size: 14px; text-align: center; padding: 70px 20px; }
   .empty code { font-family: var(--mono); font-size: 12px; }
 
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; }
+  .tab {
+    width: auto; margin: 0; padding: 5px 13px; font-size: 13px; font-weight: 500;
+    background: transparent; color: var(--muted); border-radius: 7px;
+  }
+  .tab:hover:not(.on) { background: var(--bg); color: var(--text); filter: none; }
+  .tab.on { background: var(--accent); color: #fff; }
+
+  /* Library list */
+  #search {
+    width: 100%; padding: 8px 11px; font-size: 13px; font-family: inherit;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--text); margin-bottom: 12px;
+  }
+  .item {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 11px 12px; border: 1px solid var(--border);
+    border-radius: 9px; margin-bottom: 8px; cursor: pointer;
+    background: var(--panel);
+  }
+  .item:hover { border-color: var(--accent); }
+  .item .grow { flex: 1; min-width: 0; }
+  .item .t { font-weight: 600; }
+  .item .m {
+    font-size: 12px; color: var(--muted); margin-top: 2px;
+    display: flex; gap: 10px; flex-wrap: wrap;
+  }
+  .item .m code { font-family: var(--mono); font-size: 11px; }
+  .item .acts { display: flex; gap: 4px; flex: none; }
+  .icon {
+    width: auto; margin: 0; padding: 4px 9px; font-size: 12px;
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+  }
+  .icon:hover { background: var(--bg); color: var(--text); filter: none; }
+  .icon.danger:hover { color: var(--err); border-color: var(--err); }
+
+  /* Reader */
+  #reader-head {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
+  }
+  #reader-head .t { font-weight: 600; font-size: 15px; flex: 1; min-width: 0; }
+  #reader-meta {
+    font-size: 12px; color: var(--muted); margin-bottom: 14px;
+    padding-bottom: 12px; border-bottom: 1px solid var(--border);
+  }
+
   footer {
     display: flex; gap: 16px; flex-wrap: wrap;
     font-size: 12px; color: var(--muted);
@@ -203,6 +251,10 @@
   <span class="dot" id="dot"></span>
   <h1>scribe <span id="elapsed"></span></h1>
   <span class="spacer"></span>
+  <div class="tabs">
+    <button class="tab on" id="tab-record">Record</button>
+    <button class="tab" id="tab-library">Library</button>
+  </div>
   <span id="state">idle</span>
 </header>
 
@@ -286,6 +338,23 @@
       </div>
       <button id="jump" hidden>↓ New speech</button>
     </div>
+    <div class="panel" id="library" hidden>
+      <h2>Recordings</h2>
+      <input type="text" id="search" placeholder="Search titles and transcripts…"
+             autocomplete="off">
+      <div id="items"></div>
+      <div class="empty" id="lib-empty" hidden></div>
+    </div>
+
+    <div class="panel" id="reader" hidden>
+      <div id="reader-head">
+        <span class="t" id="reader-title"></span>
+        <button class="icon" id="reader-back">← Back</button>
+      </div>
+      <div id="reader-meta"></div>
+      <div id="reader-body"></div>
+    </div>
+
     <footer id="meta" hidden>
       <span id="f-counts"></span>
       <span><code id="f-path"></code></span>
@@ -524,6 +593,7 @@ function connect() {
       $("meta").hidden = false;
       $("f-path").textContent = ev.markdown;
     } else if (ev.type === "summary") {
+      if (view === "library") loadLibrary();
       const s = ev.stats;
       const who = Object.entries(s.speakers).map(([k, v]) => `${k} ${v}`).join(", ");
       $("f-counts").textContent =
@@ -533,7 +603,173 @@ function connect() {
   es.onerror = () => { /* EventSource reconnects on its own */ };
 }
 
+/* ----------------------------------------------------------------- library */
+
+let view = "record";
+
+function setView(next) {
+  view = next;
+  $("tab-record").classList.toggle("on", next === "record");
+  $("tab-library").classList.toggle("on", next !== "record");
+
+  $("transcript").hidden = next !== "record";
+  $("meta").hidden = next !== "record" || !$("f-path").textContent;
+  $("library").hidden = next !== "library";
+  $("reader").hidden = next !== "reader";
+
+  if (next === "library") loadLibrary();
+}
+
+function human(seconds) {
+  if (seconds === null || seconds === undefined) return null;
+  const m = Math.floor(seconds / 60), s2 = Math.round(seconds % 60);
+  return m ? `${m}m ${s2}s` : `${s2}s`;
+}
+
+function whenLabel(iso) {
+  if (!iso) return "unknown date";
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString(undefined, {
+    year: "numeric", month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+async function loadLibrary() {
+  const q = $("search").value.trim();
+  let data;
+  try {
+    data = await api("/api/transcripts?q=" + encodeURIComponent(q));
+  } catch (err) {
+    addNotice({ level: "error", message: "Could not list recordings: " + err.message });
+    return;
+  }
+
+  const list = data.transcripts;
+  $("items").innerHTML = "";
+  $("lib-empty").hidden = list.length > 0;
+  // Markdown scribe did not produce is skipped rather than offered with a
+  // Delete button; say so, or an empty list looks like a bug.
+  const skipped = data.skipped
+    ? ` ${data.skipped} other markdown file${data.skipped > 1 ? "s" : ""} in this folder ${data.skipped > 1 ? "were" : "was"} ignored.`
+    : "";
+  $("lib-empty").textContent = q
+    ? `Nothing matches "${q}".`
+    : "No recordings in " + data.directory + "." + skipped;
+
+  for (const t of list) {
+    const bits = [whenLabel(t.started)];
+    const dur = human(t.duration_seconds);
+    if (dur) bits.push(dur);
+    bits.push(`${t.words} words`);
+    const who = Object.entries(t.speakers || {})
+      .map(([k, v]) => `${k} ${v}`).join(", ");
+    if (who) bits.push(who);
+
+    const row = document.createElement("div");
+    row.className = "item";
+    row.innerHTML = `
+      <div class="grow">
+        <div class="t"></div>
+        <div class="m">
+          <span></span>
+          <code></code>
+        </div>
+      </div>
+      <div class="acts">
+        <button class="icon js-rename" title="Rename">Rename</button>
+        <button class="icon danger js-delete" title="Delete">Delete</button>
+      </div>`;
+    row.querySelector(".t").textContent = t.title;
+    row.querySelector(".m span").textContent = bits.join(" · ");
+    row.querySelector(".m code").textContent = t.relative_path;
+
+    row.querySelector(".grow").onclick = () => openTranscript(t.name);
+    row.querySelector(".js-rename").onclick = e => {
+      e.stopPropagation();
+      renameTranscript(t);
+    };
+    row.querySelector(".js-delete").onclick = e => {
+      e.stopPropagation();
+      deleteTranscript(t);
+    };
+    $("items").append(row);
+  }
+}
+
+async function openTranscript(name) {
+  let data;
+  try {
+    data = await api("/api/transcripts/" + encodeURIComponent(name));
+  } catch (err) {
+    addNotice({ level: "error", message: "Could not open: " + err.message });
+    return;
+  }
+
+  $("reader-title").textContent = data.title;
+  const bits = [whenLabel(data.started)];
+  const dur = human(data.duration_seconds);
+  if (dur) bits.push(dur);
+  bits.push(`${data.words} words`);
+  if (data.model) bits.push(data.model);
+  $("reader-meta").textContent = bits.join(" · ") + " — " + data.relative_path;
+
+  const body = $("reader-body");
+  body.innerHTML = "";
+  let last = null;
+  for (const turn of data.turns) {
+    if (turn.speaker !== last) {
+      const el = document.createElement("div");
+      el.className = "turn " + (turn.speaker === "You" ? "you" : "them");
+      el.innerHTML = '<div class="who"></div><div class="what"></div>';
+      el.querySelector(".who").textContent = turn.speaker || "Transcript";
+      body.append(el);
+      last = turn.speaker;
+    }
+    const what = body.lastElementChild.querySelector(".what");
+    what.textContent = (what.textContent ? what.textContent + " " : "") + turn.text;
+  }
+  setView("reader");
+}
+
+async function renameTranscript(t) {
+  const title = prompt("Rename this recording:", t.title);
+  if (title === null || !title.trim()) return;
+  try {
+    await api(`/api/transcripts/${encodeURIComponent(t.name)}/title`, {
+      method: "POST",
+      body: JSON.stringify({ title: title.trim() }),
+    });
+    loadLibrary();
+  } catch (err) {
+    addNotice({ level: "error", message: "Rename failed: " + err.message });
+  }
+}
+
+async function deleteTranscript(t) {
+  // Irreversible: there is no trash, so make the filename explicit.
+  if (!confirm(`Delete "${t.title}" permanently?\n\n${t.relative_path}\n\n` +
+               "This cannot be undone.")) return;
+  try {
+    await api("/api/transcripts/" + encodeURIComponent(t.name), { method: "DELETE" });
+    loadLibrary();
+  } catch (err) {
+    addNotice({ level: "error", message: "Delete failed: " + err.message });
+  }
+}
+
 /* ------------------------------------------------------------------ actions */
+
+$("tab-record").onclick = () => setView("record");
+$("tab-library").onclick = () => setView("library");
+$("reader-back").onclick = () => setView("library");
+
+let searchTimer = null;
+$("search").oninput = () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(loadLibrary, 180);
+};
 
 $("why").onchange = () =>
   $("turns").classList.toggle("show-why", $("why").checked);

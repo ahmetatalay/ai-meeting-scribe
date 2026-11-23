@@ -89,7 +89,13 @@ scribe web --no-browser
 scribe web --raw ~/Desktop/transcripts
 ```
 
-Pick your microphone and meeting-audio device, press **Start transcribing**, and the transcript appears as it is produced. Two live level meters sit under the controls — if the **Meeting** meter stays flat, the meeting audio is not reaching scribe and you can fix it in seconds instead of discovering it after the call.
+Two tabs:
+
+**Record** — pick your microphone and meeting-audio device, press **Start transcribing**, and the transcript appears as it is produced. Two live level meters sit under the controls: if the **Meeting** meter stays flat, the meeting audio is not reaching scribe and you can fix it in seconds instead of discovering it after the call. The **Why?** toggle shows the per-segment speaker decision and the dB numbers behind it.
+
+**Library** — every recording in your output directory, newest first, with title, date, duration, word count and speaker breakdown. Click one to read it, rename it inline, or delete it. Search covers both titles and transcript bodies.
+
+Recordings made before sidecars existed are listed too: the date comes from the filename and the title from the document heading. Renaming only ever writes the JSON sidecar, so your markdown is never rewritten.
 
 ### Why it is loopback-only
 
@@ -98,6 +104,7 @@ The server binds `127.0.0.1` and there is deliberately **no host option**, so it
 - **Host header validation** — a page you visit can point a hostname it controls at `127.0.0.1` (DNS rebinding) and then talk to the server as same-origin. Foreign `Host` values are refused.
 - **CSRF token** — the browser's same-origin policy stops another site *reading* responses but not *sending* a `POST`. Without a token, any page you had open could start or stop a recording. The token is minted per run, embedded in the page, and required on every route.
 - **No CORS headers**, and the API docs endpoints are disabled.
+- **Path containment** — the library routes take a filename from the request and read, rename and *delete* files with it, so names are restricted to a bare filename and the resolved path must sit directly inside your output directory. `../`, absolute paths and symlinks pointing outside are all refused.
 
 To reach the UI from another machine, use an SSH local port-forward rather than widening the bind:
 
@@ -234,6 +241,7 @@ Layout:
 | `session.py` | Recording engine — owns the loop, publishes events |
 | `main.py` | CLI, rendering the engine's event stream |
 | `doctor.py` | Audio setup diagnostics |
+| `library.py` | Listing, reading, renaming and deleting transcripts |
 | `web/server.py` | Loopback web UI — FastAPI + SSE over the same event bus |
 | `web/static/index.html` | The whole front end: no build step, no dependencies |
 

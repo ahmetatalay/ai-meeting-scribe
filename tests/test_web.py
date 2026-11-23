@@ -217,6 +217,40 @@ class TestFrontEnd:
         assert tag and "hidden" in tag.group(0)
         assert "scrollToLatest" in page
 
+    def test_every_element_the_script_looks_up_exists(self, page):
+        """A typo in an id is silent at load time and only fails when that code
+        path runs, so check the whole set up front."""
+        import re
+
+        wanted = set(re.findall(r'\$\("([^"]+)"\)', page))
+        declared = set(re.findall(r'id="([^"]+)"', page))
+        missing = wanted - declared
+        assert not missing, f"script references non-existent ids: {sorted(missing)}"
+
+    def test_library_view_is_present(self, page):
+        for element_id in ("tab-record", "tab-library", "search", "items",
+                           "reader", "reader-title", "reader-body"):
+            assert f'id="{element_id}"' in page, element_id
+
+    def test_deleting_from_the_ui_asks_for_confirmation(self, page):
+        """Deletion is irreversible — there is no trash."""
+        assert "confirm(" in page
+        delete_fn = page[page.index("async function deleteTranscript"):]
+        confirm_at = delete_fn.index("confirm(")
+        request_at = delete_fn.index('method: "DELETE"')
+        assert confirm_at < request_at, "the request must not precede the confirm"
+
+    def test_user_text_is_never_interpolated_into_html(self, page):
+        """Titles and transcript text come from files; they go in as text."""
+        import re
+
+        # Inside the library/reader renderers, content is assigned via
+        # textContent rather than innerHTML.
+        section = page[page.index("async function loadLibrary"):
+                       page.index("/* ------------------------------------------------------------------ actions */")]
+        for assignment in re.findall(r"\.innerHTML\s*=\s*([^;]+);", section):
+            assert "t." not in assignment and "data." not in assignment, assignment
+
     def test_page_is_self_contained(self, page):
         """The CSP forbids external loads, so the page must not request any."""
         import re
@@ -290,6 +324,140 @@ class TestRecordingRoutes:
         res = client.post("/api/title", json={"title": "  "},
                           headers={"X-Scribe-Token": state.token})
         assert res.status_code == 400
+
+
+class TestLibraryRoutes:
+    @pytest.fixture
+    def seeded(self, tmp_path):
+        """A library directory with two transcripts, plus a file outside it."""
+        import json as _json
+
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        for name, title in (("transcript_2026-11-23_1000.md", "Sprint planning"),
+                            ("transcript_2026-11-22_0900.md", "One to one")):
+            (raw / name).write_text(
+                f"---\ntitle: {title}\nstarted: 2026-11-2{name[14]}T10:00:00\n---\n\n"
+                f"# {title}\n\n**You**: something about migrations\n",
+                encoding="utf-8",
+            )
+            (raw / name).with_suffix(".json").write_text(
+                _json.dumps({"title": title, "markdown": name, "segments": []}),
+                encoding="utf-8",
+            )
+        (tmp_path / "outside.md").write_text("private", encoding="utf-8")
+        return raw
+
+    @pytest.fixture
+    def lib_client(self, seeded):
+        st = AppState(raw_dir=seeded)
+        return TestClient(create_app(st), base_url="http://127.0.0.1:8765"), st
+
+    def test_listing(self, lib_client):
+        client, st = lib_client
+        data = client.get(f"/api/transcripts?token={st.token}").json()
+        assert len(data["transcripts"]) == 2
+        assert {t["title"] for t in data["transcripts"]} == {
+            "Sprint planning", "One to one",
+        }
+
+    def test_listing_requires_the_token(self, lib_client):
+        client, _ = lib_client
+        assert client.get("/api/transcripts").status_code == 403
+
+    def test_search(self, lib_client):
+        client, st = lib_client
+        data = client.get(f"/api/transcripts?token={st.token}&q=sprint").json()
+        assert len(data["transcripts"]) == 1
+
+    def test_reading_one(self, lib_client):
+        client, st = lib_client
+        data = client.get(
+            f"/api/transcripts/transcript_2026-11-23_1000.md?token={st.token}"
+        ).json()
+        assert data["title"] == "Sprint planning"
+        assert data["turns"][0]["speaker"] == "You"
+
+    def test_reading_a_missing_one(self, lib_client):
+        client, st = lib_client
+        res = client.get(f"/api/transcripts/transcript_1999-01-01_0000.md?token={st.token}")
+        assert res.status_code == 404
+
+    @pytest.mark.parametrize("name", ["..%2F..%2Foutside.md", "...md", "secrets.json"])
+    def test_traversal_and_bad_names_are_refused(self, lib_client, name):
+        client, st = lib_client
+        res = client.get(f"/api/transcripts/{name}?token={st.token}")
+        assert res.status_code in (400, 404), res.status_code
+
+    def test_rename(self, lib_client):
+        client, st = lib_client
+        res = client.post(
+            "/api/transcripts/transcript_2026-11-23_1000.md/title",
+            json={"title": "Quarterly review"},
+            headers={"X-Scribe-Token": st.token},
+        )
+        assert res.status_code == 200
+        listing = client.get(f"/api/transcripts?token={st.token}").json()
+        assert "Quarterly review" in {t["title"] for t in listing["transcripts"]}
+
+    def test_rename_requires_the_token(self, lib_client):
+        client, _ = lib_client
+        res = client.post("/api/transcripts/transcript_2026-11-23_1000.md/title",
+                          json={"title": "x"})
+        assert res.status_code == 403
+
+    def test_rename_rejects_an_empty_title(self, lib_client):
+        client, st = lib_client
+        res = client.post("/api/transcripts/transcript_2026-11-23_1000.md/title",
+                          json={"title": " "}, headers={"X-Scribe-Token": st.token})
+        assert res.status_code == 400
+
+    def test_delete(self, lib_client, seeded):
+        client, st = lib_client
+        res = client.delete("/api/transcripts/transcript_2026-11-23_1000.md",
+                            headers={"X-Scribe-Token": st.token})
+        assert res.status_code == 200
+        assert not (seeded / "transcript_2026-11-23_1000.md").exists()
+        assert (seeded / "transcript_2026-11-22_0900.md").exists()
+
+    def test_delete_requires_the_token(self, lib_client, seeded):
+        """Without this, any page you had open could wipe your transcripts."""
+        client, _ = lib_client
+        res = client.delete("/api/transcripts/transcript_2026-11-23_1000.md")
+        assert res.status_code == 403
+        assert (seeded / "transcript_2026-11-23_1000.md").exists()
+
+    def test_delete_cannot_escape_the_library(self, lib_client, seeded):
+        client, st = lib_client
+        outside = seeded.parent / "outside.md"
+        res = client.delete("/api/transcripts/..%2Foutside.md",
+                            headers={"X-Scribe-Token": st.token})
+        assert res.status_code in (400, 404)
+        assert outside.exists()
+
+    def test_delete_refuses_the_recording_in_progress(self, lib_client, seeded,
+                                                      monkeypatch):
+        client, st = lib_client
+        name = "transcript_2026-11-23_1000.md"
+
+        class FakeWriter:
+            path = seeded / name
+            title = "live"
+
+        class FakeSession:
+            is_running = True
+            writer = FakeWriter()
+            state = "recording"
+            capture = None
+
+            def stats_dict(self):
+                return {}
+
+        st.session = FakeSession()
+        res = client.delete(f"/api/transcripts/{name}",
+                            headers={"X-Scribe-Token": st.token})
+        assert res.status_code == 409
+        assert (seeded / name).exists()
 
 
 class TestEventStream:
