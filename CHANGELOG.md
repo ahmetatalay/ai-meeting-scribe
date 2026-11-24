@@ -1,5 +1,64 @@
 # Changelog
 
+## 2.6.0 — 2026-11-24
+
+### Added
+
+- **`scribe transcribe <file>` re-transcribes a recording.** 2.5.0 added
+  `--keep-audio` and claimed it was "useful for re-running a better model
+  later" — but nothing read the file, so the documentation promised something
+  the code did not do. This is that missing half.
+
+  It matters more than closing a gap. A machine that cannot keep up live no
+  longer has to choose a single model for two different jobs: record with one
+  fast enough to follow the meeting, then re-transcribe with a better one
+  afterwards, when nothing is waiting. The live transcript is rough but
+  immediate; the saved one is as good as the hardware can ever produce.
+
+  `SpoolReader` presents a finished recording through the same interface a
+  live capture does, so `RecordingSession` drives it unchanged — the same
+  overlap removal, boundary revision and speaker attribution. Verified on a
+  two-channel recording: identical text and identical speaker labels to the
+  live path. A mono file is read as meeting audio and says so, because there
+  is no channel separation to attribute from and splitting one would invent
+  an attribution.
+
+  Also recovers a meeting whose live transcription went wrong — the wrong
+  `--language`, or a crash — provided the audio was kept.
+
+- **`--backend metal` runs whisper.cpp on the GPU.** The default backend runs
+  ctranslate2 with int8 weights on the CPU, because ctranslate2 has no Metal
+  support compiled in: `get_supported_compute_types("mps")` raises
+  "unsupported device mps", so the GPU sat idle.
+
+  Measured on an M5 Pro through the full pipeline, 30-second window against a
+  15-second budget: `small` 4.71s → 0.50s, `large-v3-turbo` 7.78s → 0.73s,
+  and `large-v3` **16.85s → 2.07s**. Between 8x and 11x.
+
+  The last figure is the one that matters: `large-v3` goes from a model
+  nothing can follow live to one with seven times the headroom it needs. A
+  first measurement outside the pipeline suggested 15x; the honest number,
+  with this project's own voice-activity filtering and confidence checks in
+  the path, is 8–11x.
+
+  It stays **opt-in** (`uv tool install --force '.[metal]'`) for two honest
+  reasons. It is an extra dependency, and it reports one fewer confidence
+  signal: whisper.cpp gives a segment probability but no `no_speech_prob`.
+  The probability maps onto `avg_logprob` so the confidence threshold still
+  works — measured 0.78–0.90 on real speech, i.e. −0.25 to −0.10 against a
+  −1.0 threshold — and the missing signal is recorded as `None` rather than
+  `0.0`, because zero would read as "certainly speech" instead of "unknown".
+
+  Two things that had to be got right, both found by measuring rather than
+  reading: the probability field comes back **NaN** unless
+  `extract_probability=True` is passed, which would have disabled confidence
+  filtering silently (cost of asking: 0.37s against 0.35s); and whisper.cpp
+  reports segment bounds in **hundredths of a second**, which taken as
+  seconds would place every segment hours into the recording.
+
+- **`scribe doctor --speed --backend metal`** measures whichever backend you
+  are considering.
+
 ## 2.5.0 — 2026-11-24
 
 ### Changed

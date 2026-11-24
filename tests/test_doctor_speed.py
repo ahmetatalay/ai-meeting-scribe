@@ -138,7 +138,7 @@ class TestBenchmarkingUsesRealSpeech:
                             lambda *a, **k: np.zeros(16000, dtype=np.float32))
 
         class Boom:
-            def __init__(self, model_size):
+            def __init__(self, model_size, backend="cpu"):
                 raise OSError("model not found")
 
         import scribe_audio.transcriber as transcriber
@@ -156,8 +156,9 @@ class TestBenchmarkingUsesRealSpeech:
                             lambda *a, **k: np.zeros(16000, dtype=np.float32))
 
         class Instant:
-            def __init__(self, model_size):
+            def __init__(self, model_size, backend="cpu"):
                 self.model_size = model_size
+                self.backend = backend
 
             def load(self):
                 pass

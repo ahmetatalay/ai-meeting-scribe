@@ -231,6 +231,42 @@ The audio itself is **deleted once the transcript is written**, because a record
 scribe record --keep-audio      # leaves transcript_….wav beside the .md
 ```
 
+### Record fast, transcribe well
+
+If no model keeps up on your machine, you do not have to choose one that does both jobs:
+
+```bash
+scribe record --keep-audio --model small          # fast enough to follow live
+scribe transcribe ~/raw/transcript_….wav \
+    --model large-v3 --raw ~/raw                  # afterwards, properly
+```
+
+The live transcript is rough but immediate; the re-run is as good as your hardware can produce, because nothing is waiting on it. Re-transcription goes through the same pipeline — same overlap removal, same boundary revision, same speaker labels — so the result is what a live recording would have been if the machine were fast enough.
+
+This also rescues a meeting whose live transcription went wrong: the wrong `--language`, or a crash, as long as the audio was kept. A mono file works too, but every turn will be labelled `Meeting` — speaker attribution needs the two channels that `--keep-audio` writes.
+
+### Using the GPU
+
+The default backend runs on the CPU, because ctranslate2 ships without Metal support — `get_supported_compute_types("mps")` refuses the device outright, so the GPU sits idle. whisper.cpp does support Metal:
+
+```bash
+uv tool install --force '.[metal]'
+scribe record --backend metal
+scribe doctor --speed --backend metal
+```
+
+Measured on an M5 Pro, through the full pipeline, on the same 30-second window against a 15-second budget:
+
+| model | CPU (default) | GPU (`--backend metal`) | |
+|-------|---------------|-------------------------|---|
+| `small` | 4.71s | **0.50s** | 9.4x |
+| `large-v3-turbo` | 7.78s | **0.73s** | 10.6x |
+| `large-v3` | 16.85s — *falls behind* | **2.07s** — *keeps up* | 8.1x |
+
+That last row is the point: the best model goes from one nothing can follow live to one with seven times the headroom it needs.
+
+It is opt-in rather than the default for two reasons. It is an extra dependency; and whisper.cpp reports a segment probability but no no-speech probability, so one of the two confidence signals is unavailable. The probability maps onto the log-probability threshold, so low-confidence rejection still works — but the filter has one fewer thing to go on.
+
 ## How speaker detection works
 
 Your microphone carries only your voice; BlackHole carries only the meeting. For each transcribed segment, scribe compares how far each channel rises above **its own measured noise floor**.
@@ -294,14 +330,14 @@ Layout:
 | Module | Role |
 |--------|------|
 | `capture.py` | Two input streams, wall-clock aligned ring buffers |
-| `transcriber.py` | faster-whisper wrapper, confidence filtering, loop collapsing |
+| `transcriber.py` | Whisper backends (CPU / Metal), confidence filtering, loop collapsing |
 | `speakers.py` | Calibrated per-channel speaker attribution |
 | `dedup.py` | Overlap removal between consecutive windows |
 | `writer.py` | Markdown + JSON sidecar output |
 | `session.py` | Recording engine — owns the loop, publishes events |
 | `main.py` | CLI, rendering the engine's event stream |
 | `doctor.py` | Audio setup diagnostics and the per-machine speed check |
-| `spool.py` | Durable audio buffer — lets transcription run behind the meeting |
+| `spool.py` | Durable audio buffer, and reading a recording back for re-transcription |
 | `library.py` | Listing, reading, renaming and deleting transcripts |
 | `summarizer.py` | Local-LLM summaries via Ollama, with grounding prompts |
 | `related.py` | Earlier recordings sharing distinctive terms — no LLM |

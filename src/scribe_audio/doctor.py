@@ -164,7 +164,8 @@ def _speech_clip(seconds: float, sample_rate: int = 16000):
 
 
 def benchmark_models(window: float = 30.0, step: float = 15.0,
-                     models=BENCHMARK_MODELS) -> list[dict]:
+                     models=BENCHMARK_MODELS,
+                     backend: str = "cpu") -> list[dict]:
     """Time one window per model and say which can keep up on this machine.
 
     The budget is the step, not the window: a window is produced every step
@@ -180,7 +181,7 @@ def benchmark_models(window: float = 30.0, step: float = 15.0,
     results = []
     for name in models:
         try:
-            model = Transcriber(model_size=name)
+            model = Transcriber(model_size=name, backend=backend)
             model.load()
             model.transcribe_segments(audio)            # warm the graph
             start = time.perf_counter()
@@ -216,7 +217,7 @@ def recommend_model(results: list[dict], safety: float = 1.5) -> str | None:
 
 
 def run_doctor(benchmark: bool = False, window: float = 30.0,
-               step: float = 15.0) -> None:
+               step: float = 15.0, backend: str = "cpu") -> None:
     print(f"\n{BOLD}scribe doctor{RESET}\n")
     total = 6 if benchmark else 5
     failures = 0
@@ -312,11 +313,13 @@ def run_doctor(benchmark: bool = False, window: float = 30.0,
     # 6. Transcription speed -------------------------------------------------
     if benchmark:
         print(f"\n{BOLD}[6/{total}] Transcription speed on this machine{RESET}")
+        print(f"  Backend: {backend}")
         print(f"  A {window:.0f}s window is produced every {step:.0f}s, so each "
               f"one must finish\n  inside {step:.0f}s to keep up live. "
               f"Measuring, this takes a minute...")
         try:
-            results = benchmark_models(window=window, step=step)
+            results = benchmark_models(window=window, step=step,
+                                       backend=backend)
             print()
             print(f"  {'model':16s} {'per window':>11s} {'xRT':>7s}  verdict")
             for r in results:

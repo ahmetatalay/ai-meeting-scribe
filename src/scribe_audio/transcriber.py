@@ -19,6 +19,8 @@ transcripts from flipping speaker mid-sentence.
 from __future__ import annotations
 
 import logging
+import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -115,8 +117,46 @@ def collapse_repetitions(
     return " ".join(words)
 
 
+BACKEND_CPU = "cpu"       # ctranslate2, int8 on the CPU
+BACKEND_METAL = "metal"   # whisper.cpp, Apple GPU via Metal
+BACKENDS = (BACKEND_CPU, BACKEND_METAL)
+
+# whisper.cpp reports segment boundaries in hundredths of a second.
+_CENTISECONDS = 100.0
+
+
+@dataclass
+class _Segment:
+    """One segment, in the shape the filtering below expects.
+
+    The two backends report different things, so each normalises to this.
+    ``no_speech_prob`` is None where a backend does not expose it; _reject()
+    skips that check rather than inventing a value.
+    """
+
+    start: float
+    end: float
+    text: str
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
+
+
+@dataclass
+class _Info:
+    language: str | None = None
+    language_probability: float = 0.0
+
+
 class Transcriber:
-    """Transcribes audio windows using faster-whisper (local Whisper)."""
+    """Transcribes audio windows using local Whisper.
+
+    Two backends. ``cpu`` runs ctranslate2 with int8 weights and is the
+    default: it needs no extra dependency and reports both confidence signals.
+    ``metal`` runs whisper.cpp on the GPU: measured 8-11x faster through this
+    pipeline on an M5 Pro (`small` 4.71s -> 0.50s, `large-v3` 16.85s -> 2.07s
+    on a 30-second window), at the cost of an extra dependency and one of the
+    two confidence signals.
+    """
 
     def __init__(
         self,
@@ -128,6 +168,7 @@ class Transcriber:
         collapse_loops: bool = True,
         pin_language: bool = True,
         language_confidence: float = 0.6,
+        backend: str = BACKEND_CPU,
     ):
         """
         Args:
@@ -141,6 +182,11 @@ class Transcriber:
                 instead of re-detecting every window.
             language_confidence: detection probability required to pin.
         """
+        if backend not in BACKENDS:
+            raise ValueError(
+                f"unknown backend {backend!r}; expected one of {BACKENDS}"
+            )
+        self.backend = backend
         self.model_size = model_size
         self.requested_language = language
         self.language = language
@@ -158,6 +204,10 @@ class Transcriber:
 
     def load(self) -> None:
         """Load the model, downloading it on first use."""
+        if self.backend == BACKEND_METAL:
+            self._load_metal()
+            return
+
         import ctranslate2
         from faster_whisper import WhisperModel
 
@@ -174,6 +224,27 @@ class Transcriber:
             self.model_size,
             device="cpu",         # CPU works well on Apple Silicon
             compute_type="int8",  # fast, low memory
+        )
+
+    def _load_metal(self) -> None:
+        """Load whisper.cpp, which uses the GPU through Metal."""
+        import os
+
+        try:
+            from pywhispercpp.model import Model
+        except ImportError as exc:  # pragma: no cover - depends on install
+            raise RuntimeError(
+                "The metal backend needs pywhispercpp: "
+                "uv tool install --force '.[metal]'"
+            ) from exc
+
+        # whisper.cpp writes its own init and per-inference log to stderr,
+        # which lands in the middle of the transcript stream.
+        self._model = Model(
+            self.model_size,
+            print_progress=False,
+            print_realtime=False,
+            redirect_whispercpp_logs_to=os.devnull,
         )
 
     @property
@@ -194,13 +265,10 @@ class Transcriber:
         if flat.size == 0 or float(np.max(np.abs(flat))) < SILENCE_PEAK:
             return []
 
-        segments, info = self._model.transcribe(
-            flat,
-            language=self.language,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-        )
+        if self.backend == BACKEND_METAL:
+            segments, info = self._run_metal(flat)
+        else:
+            segments, info = self._run_cpu(flat)
         self.last_detected_language = getattr(info, "language", None)
 
         kept = []
@@ -216,17 +284,69 @@ class Transcriber:
                 if collapsed != text:
                     self.collapsed_count += 1
                     text = collapsed
+            logprob = getattr(segment, "avg_logprob", None)
+            no_speech = getattr(segment, "no_speech_prob", None)
             kept.append({
                 "start": float(segment.start),
                 "end": float(segment.end),
                 "text": text,
-                "avg_logprob": float(getattr(segment, "avg_logprob", 0.0) or 0.0),
-                "no_speech_prob": float(getattr(segment, "no_speech_prob", 0.0) or 0.0),
+                "avg_logprob": 0.0 if logprob is None else float(logprob),
+                # None, not 0.0, where the backend does not report it: zero
+                # would read as "certainly speech" rather than "unknown".
+                "no_speech_prob": None if no_speech is None else float(no_speech),
             })
 
         if kept:
             self._maybe_pin_language(info)
         return kept
+
+    def _run_cpu(self, flat: np.ndarray):
+        segments, info = self._model.transcribe(
+            flat,
+            language=self.language,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+        return segments, info
+
+    def _run_metal(self, flat: np.ndarray):
+        """Run whisper.cpp and normalise what it reports.
+
+        It gives one probability per segment rather than an average log
+        probability, and no no-speech probability at all. The probability maps
+        onto avg_logprob directly, so the confidence threshold keeps working;
+        the missing signal is left as None so _reject() skips that check
+        instead of treating absence as certainty.
+
+        extract_probability must be asked for — without it the field comes
+        back NaN, which would silently disable confidence filtering. Measured
+        cost of asking: 0.37s against 0.35s.
+        """
+        raw = self._model.transcribe(
+            flat,
+            language=self.language or "auto",
+            extract_probability=True,
+        )
+
+        segments = []
+        for item in raw:
+            probability = float(getattr(item, "probability", float("nan")))
+            if probability != probability or probability <= 0:   # NaN or zero
+                avg_logprob = None
+            else:
+                avg_logprob = math.log(min(1.0, probability))
+            segments.append(_Segment(
+                start=float(item.t0) / _CENTISECONDS,
+                end=float(item.t1) / _CENTISECONDS,
+                text=item.text or "",
+                avg_logprob=avg_logprob,
+                no_speech_prob=None,
+            ))
+
+        detected = self.language
+        probability = 1.0 if self.language else 0.0
+        return segments, _Info(language=detected, language_probability=probability)
 
     def _maybe_pin_language(self, info) -> None:
         """Lock in the first confident detection.

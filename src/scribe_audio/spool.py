@@ -172,3 +172,154 @@ class AudioSpool:
     def __exit__(self, *exc) -> bool:
         self.close()
         return False
+
+
+class SpoolReader:
+    """Reads a finished spool as windows, in place of a live capture.
+
+    RecordingSession drives everything through capture.get_window(), so a
+    reader with the same shape re-runs the whole pipeline over a recording:
+    the same transcription, overlap removal, boundary revision and speaker
+    attribution a live session would have produced.
+
+    That makes "record with a model fast enough to keep up, then re-transcribe
+    with a better one afterwards" possible, which is a better answer than
+    choosing a single model that has to do both jobs.
+    """
+
+    def __init__(self, path: Path | str, window_duration: float = 30.0,
+                 step_duration: float = 15.0):
+        import wave
+
+        if window_duration <= 0 or step_duration <= 0:
+            raise ValueError("window and step durations must be positive")
+        if step_duration > window_duration:
+            raise ValueError("step must not exceed window")
+
+        self.path = Path(path)
+        with wave.open(str(self.path)) as w:
+            if w.getsampwidth() != SAMPLE_WIDTH:
+                raise ValueError(
+                    f"{self.path.name}: expected 16-bit PCM, "
+                    f"got {w.getsampwidth() * 8}-bit"
+                )
+            self.sample_rate = w.getframerate()
+            self._channels = w.getnchannels()
+            frames = w.getnframes()
+            raw = w.readframes(frames)
+
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / _INT16_PEAK
+        if self._channels == CHANNELS:
+            stereo = samples.reshape(-1, CHANNELS)
+            self._mic, self._meeting = stereo[:, 0], stereo[:, 1]
+        elif self._channels == 1:
+            # A mono recording carries no channel separation, so there is
+            # nothing to attribute speakers from. Treating it as meeting audio
+            # labels every turn "Meeting", which is honest; splitting it
+            # between the two would invent an attribution.
+            self._mic = np.zeros(samples.size, dtype=np.float32)
+            self._meeting = samples
+        else:
+            raise ValueError(
+                f"{self.path.name}: expected 1 or 2 channels, "
+                f"got {self._channels}"
+            )
+
+        self.window_duration = window_duration
+        self.step_duration = step_duration
+        self._window_frames = int(round(window_duration * self.sample_rate))
+        self._step_frames = max(1, int(round(step_duration * self.sample_rate)))
+        self._read_frame = 0
+        self._total = self._mic.size
+        self._stopped = False
+
+    @property
+    def duration(self) -> float:
+        return self._total / self.sample_rate
+
+    @property
+    def is_mono(self) -> bool:
+        """True when the source has no channel separation to attribute from."""
+        return self._channels == 1
+
+    # The capture interface RecordingSession expects ------------------------
+
+    def start(self) -> None:
+        self._stopped = False
+
+    def stop(self) -> None:
+        self._stopped = True
+
+    @property
+    def is_stopped(self) -> bool:
+        # Exhausting the file is the end of the recording, so the session's
+        # loop sees the same "no more audio" signal a stopped device gives.
+        return self._stopped or self._read_frame >= self._total
+
+    def get_window(self, timeout: float | None = None):
+        from .capture import Window
+
+        if self._stopped or self._read_frame >= self._total:
+            return None
+        end = min(self._read_frame + self._step_frames, self._total)
+        return self._build(end)
+
+    def flush(self):
+        from .capture import Window  # noqa: F401  (documents the return type)
+
+        if self._read_frame >= self._total:
+            return None
+        return self._build(self._total)
+
+    def _build(self, end_frame: int):
+        from .capture import Window
+
+        start_frame = max(0, end_frame - self._window_frames)
+        mic = self._mic[start_frame:end_frame]
+        meeting = self._meeting[start_frame:end_frame]
+        self._read_frame = end_frame
+        return Window(
+            mono=np.clip(mic + meeting, -1.0, 1.0),
+            mic=mic,
+            meeting=meeting,
+            end_time=end_frame / self.sample_rate,
+            sample_rate=self.sample_rate,
+            dropped_seconds=0.0,
+            backlog_seconds=(self._total - end_frame) / self.sample_rate,
+        )
+
+    @property
+    def backlog_seconds(self) -> float:
+        return (self._total - self._read_frame) / self.sample_rate
+
+    def set_step(self, step_duration: float) -> None:
+        """Accepted but ignored: re-transcription is not racing a meeting.
+
+        Widening the step trades boundary correction for throughput, which is
+        only worth doing to keep up live. A file has no deadline, so taking
+        the quality is strictly better.
+        """
+        return
+
+    def levels(self) -> dict:
+        return {
+            "mic": 0.0, "meeting": 0.0,
+            "mic_active": not self.is_mono, "meeting_active": True,
+            "stalled": [],
+        }
+
+    @property
+    def stalled_streams(self) -> list[str]:
+        return []
+
+    @property
+    def errors(self) -> list[str]:
+        return []
+
+    def keep_spool(self, destination: Path | str) -> Path:
+        """The source file is the user's own; never move it."""
+        return self.path
+
+    def discard_spool(self) -> None:
+        """Never delete the file being read from."""
+        return

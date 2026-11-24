@@ -8,6 +8,8 @@ import queue
 import signal
 import sys
 import threading
+import wave
+from pathlib import Path
 
 from .capture import find_device, get_system_audio, list_devices
 from .doctor import run_doctor
@@ -101,6 +103,63 @@ def _warn_silent_loopback() -> None:
     print()
 
 
+def run_transcribe(args) -> None:
+    """Transcribe a recorded file through the same pipeline as a live session.
+
+    Re-running a recording is the answer to a machine that cannot keep up
+    live: record with a model fast enough to follow the meeting, then
+    re-transcribe with a better one afterwards, when nothing is waiting. It
+    also recovers a meeting whose live transcription went wrong — the wrong
+    --language, or a crash — provided --keep-audio was set.
+    """
+    from .spool import SpoolReader
+
+    source = Path(args.audio).expanduser()
+    if not source.is_file():
+        print(f"[main] No such file: {source}")
+        raise SystemExit(1)
+
+    try:
+        reader = SpoolReader(source, window_duration=args.window,
+                             step_duration=args.step)
+    except (ValueError, OSError, wave.Error) as exc:
+        print(f"[main] Cannot read {source.name}: {exc}")
+        raise SystemExit(1) from exc
+
+    print(f"[main] Source: {source}")
+    print(f"[main] Length: {reader.duration / 60:.1f} min")
+    if reader.is_mono:
+        print("[main] ⚠ Mono recording — no channel separation, so every turn")
+        print("       will be labelled 'Meeting'. Speaker attribution needs")
+        print("       the two-channel audio that --keep-audio produces.")
+
+    config = SessionConfig(
+        # The devices are not opened; they only tell the session that both
+        # channels exist, so speaker attribution behaves as it did live.
+        mic_device=None if reader.is_mono else 0,
+        system_device=0,
+        model=args.model,
+        language=None if args.language in ("auto", "") else args.language,
+        window=args.window,
+        step=args.step,
+        raw_dir=args.raw or os.environ.get("SCRIBE_RAW_DIR", "./raw"),
+        title=args.title,
+        mic_margin=args.mic_margin,
+        use_speakers=not args.no_speakers and not reader.is_mono,
+        keep_filler=args.keep_filler,
+        backend=args.backend,
+        # The source file is the user's; it is neither moved nor deleted, and
+        # there is no deadline to trade boundary corrections against.
+        keep_audio=False,
+        adaptive_step=False,
+    )
+
+    session = RecordingSession(config, capture_factory=lambda cfg: reader)
+    events = session.bus.subscribe()
+    session.start()
+    _render_events(session, events, live=False)
+
+
 def cmd_record(args) -> None:
     """Capture, transcribe and write a transcript until interrupted."""
     mic_id, system_id = _resolve_devices(args)
@@ -117,6 +176,7 @@ def cmd_record(args) -> None:
         mic_margin=args.mic_margin,
         use_speakers=not args.no_speakers,
         keep_filler=args.keep_filler,
+        backend=args.backend,
         keep_audio=args.keep_audio,
         adaptive_step=not args.no_adaptive_step,
     )
@@ -141,8 +201,13 @@ def cmd_record(args) -> None:
     _render_events(session, events)
 
 
-def _render_events(session: RecordingSession, events: queue.Queue) -> None:
-    """Print the session's event stream until it finishes."""
+def _render_events(session: RecordingSession, events: queue.Queue,
+                   live: bool = True) -> None:
+    """Print the session's event stream until it finishes.
+
+    ``live`` is False when the audio comes from a file, where "press Ctrl+C to
+    stop" is the wrong instruction and the progress wording differs.
+    """
     while True:
         try:
             event = events.get(timeout=0.25)
@@ -153,7 +218,7 @@ def _render_events(session: RecordingSession, events: queue.Queue) -> None:
 
         kind = event.get("type")
         if kind == "state":
-            _render_state(event)
+            _render_state(event, live=live)
         elif kind == "segments":
             for seg in event["segments"]:
                 print(f"  {seg['speaker']}: {seg['text']}")
@@ -163,21 +228,22 @@ def _render_events(session: RecordingSession, events: queue.Queue) -> None:
             else:
                 marker = "✗" if event["level"] == "error" else "⚠"
                 print(f"\n[main] {marker} {event['message']}\n")
-        elif kind == "session" and event.get("markdown"):
-            print(f"[main] Transcript: {event['markdown']}")
         elif kind == "summary":
             _render_summary(event)
             break
 
 
-def _render_state(event: dict) -> None:
+def _render_state(event: dict, live: bool = True) -> None:
     value = event["value"]
     if value == STATE_LOADING:
         print(f"[main] Loading model '{event.get('model')}'...")
     elif value == STATE_RECORDING:
         speakers = "ON" if event.get("speakers") else "OFF"
         print(f"[main] Speaker detection: {speakers}")
-        print("[main] Recording... Press Ctrl+C to stop.\n")
+        if live:
+            print("[main] Recording... Press Ctrl+C to stop.\n")
+        else:
+            print("[main] Transcribing...\n")
     elif value == STATE_ERROR:
         print(f"[main] Failed: {event.get('error', 'unknown error')}")
 
@@ -239,6 +305,33 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("devices", help="List audio input and output devices")
+    tr = sub.add_parser(
+        "transcribe",
+        help="Re-transcribe a recorded audio file (from --keep-audio)",
+    )
+    tr.add_argument("audio", help="WAV file to transcribe")
+    tr.add_argument("--model", "-m", default="large-v3-turbo",
+                    help="Whisper model (default: large-v3-turbo — there is no "
+                         "deadline here, so quality beats speed)")
+    tr.add_argument("--language", "-l", default="auto",
+                    help="Language code, or 'auto' to detect (default: auto)")
+    tr.add_argument("--raw", "-r", default=None, help="Output directory")
+    tr.add_argument("--title", "-t", default=None, help="Meeting title")
+    tr.add_argument("--window", "-w", type=float, default=30.0,
+                    help="Transcription window in seconds (default: 30)")
+    tr.add_argument("--step", "-s", type=float, default=15.0,
+                    help="Seconds between transcriptions (default: 15)")
+    tr.add_argument("--mic-margin", type=float, default=8.0,
+                    help="dB above the mic's own noise floor that counts as "
+                         "your speech")
+    tr.add_argument("--no-speakers", action="store_true",
+                    help="Do not label who is speaking")
+    tr.add_argument("--backend", choices=("cpu", "metal"), default="cpu",
+                     help="cpu (default) or metal — whisper.cpp on the GPU, "
+                          "measured 8-11x faster; needs .[metal] installed")
+    tr.add_argument("--keep-filler", action="store_true",
+                    help="Keep low-confidence filler segments")
+
     p_doctor = sub.add_parser("doctor", help="Diagnose the audio setup")
     p_doctor.add_argument(
         "--speed", action="store_true",
@@ -247,6 +340,10 @@ def main() -> None:
     p_doctor.add_argument(
         "--window", type=float, default=30.0,
         help="Window the speed check assumes (default: 30)",
+    )
+    p_doctor.add_argument(
+        "--backend", choices=("cpu", "metal"), default="cpu",
+        help="Backend the speed check measures (default: cpu)",
     )
     p_doctor.add_argument(
         "--step", type=float, default=15.0,
@@ -297,6 +394,9 @@ def main() -> None:
                           "speech (default: 8)")
     rec.add_argument("--no-speakers", action="store_true",
                      help="Disable speaker labelling")
+    rec.add_argument("--backend", choices=("cpu", "metal"), default="cpu",
+                     help="cpu (default) or metal — whisper.cpp on the GPU, "
+                          "measured 8-11x faster; needs .[metal] installed")
     rec.add_argument("--keep-filler", action="store_true",
                      help="Keep low-confidence filler segments ('You', 'Thank you.')")
     rec.add_argument("--keep-audio", action="store_true",
@@ -322,8 +422,11 @@ def main() -> None:
 
     if args.command == "devices":
         cmd_devices(args)
+    elif args.command == "transcribe":
+        return run_transcribe(args)
     elif args.command == "doctor":
-        run_doctor(benchmark=args.speed, window=args.window, step=args.step)
+        run_doctor(benchmark=args.speed, window=args.window,
+                   step=args.step, backend=args.backend)
     elif args.command == "record":
         cmd_record(args)
     elif args.command == "web":

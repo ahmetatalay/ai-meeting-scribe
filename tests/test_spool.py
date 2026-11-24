@@ -243,3 +243,139 @@ class TestConcurrency:
 
         assert not errors, errors
         assert spool.frames_written == 100000
+
+
+class TestSpoolReader:
+    """Re-transcribing a recording runs the same pipeline a live session does,
+    which is what makes "record with a fast model, re-transcribe with a good
+    one" possible — a better answer than choosing one model for both jobs."""
+
+    def write_stereo(self, path, mic, meeting, sample_rate=SR):
+        s = AudioSpool(path, sample_rate)
+        s.append(mic, meeting)
+        s.close()
+        return path
+
+    def test_it_reads_back_both_channels(self, tmp_path):
+        from scribe_audio.spool import SpoolReader
+
+        path = self.write_stereo(
+            tmp_path / "a.wav",
+            np.full(SR * 4, 0.4, dtype=np.float32),
+            np.full(SR * 4, 0.1, dtype=np.float32),
+        )
+        reader = SpoolReader(path, window_duration=2.0, step_duration=2.0)
+        win = reader.get_window()
+        assert np.allclose(win.mic, 0.4, atol=1e-4)
+        assert np.allclose(win.meeting, 0.1, atol=1e-4)
+
+    def test_every_second_of_the_file_is_covered(self, tmp_path):
+        from scribe_audio.spool import SpoolReader
+
+        marks = np.concatenate([
+            np.full(SR, (i + 1) / 100.0, dtype=np.float32) for i in range(8)
+        ])
+        path = self.write_stereo(tmp_path / "a.wav", marks,
+                                 np.zeros_like(marks))
+        reader = SpoolReader(path, window_duration=2.0, step_duration=1.0)
+
+        seen = set()
+        while True:
+            win = reader.get_window()
+            if win is None:
+                break
+            for v in np.unique(np.round(win.mic * 100).astype(int)):
+                if v > 0:
+                    seen.add(int(v))
+        assert seen == set(range(1, 9))
+
+    def test_it_reports_exhaustion_as_stopped(self, tmp_path):
+        from scribe_audio.spool import SpoolReader
+
+        path = self.write_stereo(tmp_path / "a.wav",
+                                 np.full(SR, 0.2, dtype=np.float32),
+                                 np.zeros(SR, dtype=np.float32))
+        reader = SpoolReader(path, window_duration=1.0, step_duration=1.0)
+        assert not reader.is_stopped
+        reader.get_window()
+        assert reader.is_stopped, "the session loop ends on this"
+        assert reader.get_window() is None
+
+    def test_duration_is_reported(self, tmp_path):
+        from scribe_audio.spool import SpoolReader
+
+        path = self.write_stereo(tmp_path / "a.wav",
+                                 np.zeros(SR * 5, dtype=np.float32),
+                                 np.zeros(SR * 5, dtype=np.float32))
+        assert SpoolReader(path).duration == pytest.approx(5.0)
+
+    def test_a_mono_file_is_read_as_meeting_audio(self, tmp_path):
+        """There is no channel separation to attribute from, so labelling
+        everything 'Meeting' is honest; splitting it would invent one."""
+        import wave
+
+        from scribe_audio.spool import SpoolReader
+
+        path = tmp_path / "mono.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SR)
+            w.writeframes((np.full(SR, 0.3) * 32767).astype(np.int16).tobytes())
+
+        reader = SpoolReader(path, window_duration=1.0, step_duration=1.0)
+        assert reader.is_mono
+        win = reader.get_window()
+        assert np.allclose(win.meeting, 0.3, atol=1e-4)
+        assert np.all(win.mic == 0.0)
+
+    def test_an_eight_bit_file_is_refused_with_a_reason(self, tmp_path):
+        import wave
+
+        from scribe_audio.spool import SpoolReader
+
+        path = tmp_path / "eight.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(1)
+            w.setframerate(SR)
+            w.writeframes(b"\x80" * SR)
+        with pytest.raises(ValueError, match="16-bit"):
+            SpoolReader(path)
+
+    def test_the_source_file_is_never_deleted(self, tmp_path):
+        """discard_spool() deletes a live capture's scratch file; a file the
+        user pointed us at is theirs."""
+        from scribe_audio.spool import SpoolReader
+
+        path = self.write_stereo(tmp_path / "a.wav",
+                                 np.zeros(SR, dtype=np.float32),
+                                 np.zeros(SR, dtype=np.float32))
+        reader = SpoolReader(path)
+        reader.discard_spool()
+        reader.keep_spool(tmp_path / "elsewhere.wav")
+        assert path.exists()
+        assert not (tmp_path / "elsewhere.wav").exists()
+
+    def test_widening_the_step_is_ignored(self, tmp_path):
+        """A file has no deadline, so trading boundary corrections for
+        throughput would give up quality for nothing."""
+        from scribe_audio.spool import SpoolReader
+
+        path = self.write_stereo(tmp_path / "a.wav",
+                                 np.zeros(SR * 4, dtype=np.float32),
+                                 np.zeros(SR * 4, dtype=np.float32))
+        reader = SpoolReader(path, window_duration=2.0, step_duration=1.0)
+        reader.set_step(2.0)
+        assert reader.step_duration == 1.0
+
+    def test_a_backlog_is_reported_as_what_is_left(self, tmp_path):
+        from scribe_audio.spool import SpoolReader
+
+        path = self.write_stereo(tmp_path / "a.wav",
+                                 np.zeros(SR * 6, dtype=np.float32),
+                                 np.zeros(SR * 6, dtype=np.float32))
+        reader = SpoolReader(path, window_duration=2.0, step_duration=2.0)
+        assert reader.backlog_seconds == pytest.approx(6.0)
+        reader.get_window()
+        assert reader.backlog_seconds == pytest.approx(4.0)

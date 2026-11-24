@@ -85,6 +85,8 @@ class SessionConfig:
     mic_margin: float = 8.0
     use_speakers: bool = True
     keep_filler: bool = False
+    # 'cpu' (ctranslate2, default) or 'metal' (whisper.cpp on the GPU).
+    backend: str = "cpu"
     level_interval: float = 0.5
     # Automatic refresh is off by default. A 14B model costs around 20GB
     # resident and seconds of CPU per pass; refreshing every few seconds kept
@@ -260,6 +262,7 @@ class RecordingSession:
             model_size=cfg.model,
             language=cfg.language,
             drop_filler=not cfg.keep_filler,
+            backend=cfg.backend,
         )
 
     def _default_writer(self, cfg: SessionConfig) -> TranscriptWriter:
