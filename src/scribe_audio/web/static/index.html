@@ -331,6 +331,13 @@
         <label for="speakers" style="margin:0">Label who is speaking</label>
       </div>
 
+      <div class="row" style="align-items:center; gap:.5rem">
+        <input type="checkbox" id="keep-audio">
+        <label for="keep-audio" style="margin:0" title="The recording is
+          deleted once the transcript is written. Keeping it lets you
+          re-transcribe with a better model later.">Keep the audio file</label>
+      </div>
+
       <div class="notice warning" id="pair-warn" hidden></div>
 
       <button id="go">Start transcribing</button>
@@ -1106,6 +1113,7 @@ $("go").onclick = async () => {
           language: $("lang").value,
           title: $("title").value.trim() || null,
           use_speakers: $("speakers").checked,
+          keep_audio: $("keep-audio").checked,
         }),
       });
     }

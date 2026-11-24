@@ -732,3 +732,53 @@ class TestInstanceHygiene:
         from scribe_audio.web.server import IDLE_KEEPALIVE_SECONDS
 
         assert IDLE_KEEPALIVE_SECONDS >= 10
+
+
+class TestKeepAudio:
+    """The captured audio is deleted by default; keeping it is a per-recording
+    choice, because a recording of a meeting is more sensitive than a
+    transcript of it."""
+
+    def _start(self, client, state, monkeypatch, body):
+        from scribe_audio.web import server as mod
+
+        captured = {}
+
+        class Fake:
+            def __init__(self, config, *a, **k):
+                captured["config"] = config
+                self.state = "recording"
+                self.is_running = True
+                self.writer = None
+                self.capture = None
+
+            def start(self):
+                pass
+
+            def stats_dict(self):
+                return {}
+
+        monkeypatch.setattr(mod, "RecordingSession", Fake)
+        res = client.post("/api/start", json=body,
+                          headers={"X-Scribe-Token": state.token})
+        assert res.status_code == 200, res.text
+        return captured["config"]
+
+    def test_the_default_does_not_keep_audio(self, client, state, monkeypatch):
+        config = self._start(client, state, monkeypatch, {"mic_device": 0})
+        assert config.keep_audio is False
+
+    def test_it_can_be_asked_for(self, client, state, monkeypatch):
+        config = self._start(client, state, monkeypatch,
+                             {"mic_device": 0, "keep_audio": True})
+        assert config.keep_audio is True
+
+    def test_the_page_offers_the_choice(self):
+        """A setting with no control is a setting nobody uses."""
+        from pathlib import Path
+
+        import scribe_audio.web.server as server
+
+        page = (Path(server.__file__).parent / "static" / "index.html").read_text()
+        assert 'id="keep-audio"' in page
+        assert "keep_audio:" in page

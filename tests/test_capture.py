@@ -15,6 +15,10 @@ from scribe_audio.capture import (
 
 SR = 1000  # low rate keeps the arrays small and the arithmetic readable
 
+# The spool stores 16-bit PCM, so audio round-trips within one LSB rather than
+# exactly. Inaudible for speech (96dB of range); visible to an == assertion.
+PCM_TOL = 1e-4
+
 
 class FakeClock:
     def __init__(self, start: float = 1000.0):
@@ -136,12 +140,16 @@ class TestWindowing:
         assert float(np.min(np.abs(win.mic))) > 0.0
 
     def test_full_window_is_kept_once_enough_audio_exists(self):
+        """Windows are read in order from the start, so the opening one spans
+        only a step; from the second onwards they are the full width."""
         clock = FakeClock()
         cap = make_capture(clock, window=2.0, step=1.0)
         feed_both(cap, clock, seconds=4.0, mic_value=0.3)
 
-        win = cap.get_window(timeout=0)
-        assert win.duration == pytest.approx(2.0)
+        first = cap.get_window(timeout=0)
+        assert first.duration == pytest.approx(1.0)
+        second = cap.get_window(timeout=0)
+        assert second.duration == pytest.approx(2.0)
 
     def test_windows_arrive_once_per_step(self):
         clock = FakeClock()
@@ -159,7 +167,7 @@ class TestWindowing:
         cap = make_capture(clock)
         feed_both(cap, clock, seconds=2.0, mic_value=0.3, meeting_value=0.2)
         win = cap.get_window(timeout=0)
-        assert np.allclose(win.mono[-SR:], 0.5)
+        assert np.allclose(win.mono[-SR:], 0.5, atol=PCM_TOL)
 
     def test_mono_clips_rather_than_wrapping(self):
         clock = FakeClock()
@@ -173,8 +181,8 @@ class TestWindowing:
         cap = make_capture(clock)
         feed_both(cap, clock, seconds=2.0, mic_value=0.4, meeting_value=0.1)
         win = cap.get_window(timeout=0)
-        assert np.allclose(win.mic[-SR:], 0.4)
-        assert np.allclose(win.meeting[-SR:], 0.1)
+        assert np.allclose(win.mic[-SR:], 0.4, atol=PCM_TOL)
+        assert np.allclose(win.meeting[-SR:], 0.1, atol=PCM_TOL)
 
 
 class TestAlignment:
@@ -217,10 +225,10 @@ class TestAlignment:
             now = clock.advance(0.1)
             cap.feed_mic(tone(int(SR * 0.1)), now)
             cap.feed_system(tone(int(SR * 0.1)), now - 0.5)
-        win = cap.get_window(timeout=0)
-        assert win is not None
-        # Alignment end follows the lagging stream, not the leading one.
-        assert win.end_time == pytest.approx(clock.now - 0.5)
+        # Nothing beyond the lagging stream may reach the spool, so no window
+        # can ever contain audio the slower stream has not delivered.
+        assert cap.spool.seconds_written == pytest.approx(
+            clock.now - 0.5 - 1000.0, abs=0.11)
 
 
 class TestStreamLoss:
@@ -244,7 +252,7 @@ class TestStreamLoss:
         assert "mic" in cap.stalled_streams
         win = cap.get_window(timeout=0)
         assert win is not None
-        assert np.allclose(win.meeting[-SR:], 0.2)
+        assert np.allclose(win.meeting[-SR:], 0.2, atol=PCM_TOL)
 
     def test_system_only_capture_is_valid(self):
         clock = FakeClock()
@@ -263,7 +271,7 @@ class TestStreamLoss:
         win = cap.get_window(timeout=0)
         assert win is not None
         assert np.all(win.mic == 0)
-        assert np.allclose(win.meeting[-SR:], 0.5)
+        assert np.allclose(win.meeting[-SR:], 0.5, atol=PCM_TOL)
 
     def test_requires_at_least_one_device(self):
         with pytest.raises(ValueError):
@@ -275,23 +283,61 @@ class TestStreamLoss:
                               window_duration=10.0, step_duration=20.0)
 
 
-class TestDropDetection:
-    def test_falling_behind_is_reported(self):
-        """If more than a window of audio passes between calls, some was lost."""
+class TestFallingBehindLosesNothing:
+    """The guarantee the spool exists to provide.
+
+    A ring buffer addressed by wall clock dropped whatever it could not hold:
+    measured on a passively cooled MacBook Air running large-v3, one cycle
+    reported 117 seconds of audio gone, twenty-five times over, with matching
+    holes in the transcript. Reading by frame position instead means a slow
+    machine finishes late rather than destroying what it could not reach.
+    """
+
+    def test_a_slow_reader_still_receives_every_window(self):
+        clock = FakeClock()
+        cap = make_capture(clock, window=2.0, step=1.0)
+        # Six seconds arrive while transcription does nothing at all.
+        feed_both(cap, clock, seconds=6.0)
+
+        windows = []
+        while True:
+            win = cap.get_window(timeout=0)
+            if win is None:
+                break
+            windows.append(win)
+
+        assert len(windows) == 6, "one window per step, none skipped"
+        assert all(w.dropped_seconds == 0.0 for w in windows)
+
+    def test_the_audio_a_slow_reader_gets_is_the_audio_that_arrived(self):
+        """Not just the right number of windows — the right content, in order."""
+        clock = FakeClock()
+        cap = make_capture(clock, window=1.0, step=1.0)
+        for value in (0.1, 0.2, 0.3, 0.4):
+            feed_both(cap, clock, seconds=1.0, mic_value=value)
+
+        seen = []
+        while True:
+            win = cap.get_window(timeout=0)
+            if win is None:
+                break
+            seen.append(round(float(np.median(win.mic)), 2))
+
+        assert seen == [0.1, 0.2, 0.3, 0.4]
+
+    def test_backlog_reports_how_far_behind_transcription_is(self):
         clock = FakeClock()
         cap = make_capture(clock, window=2.0, step=1.0)
         feed_both(cap, clock, seconds=1.0)
-        first = cap.get_window(timeout=0)
-        assert first is not None
-        assert first.dropped_seconds == 0.0
+        assert cap.get_window(timeout=0).backlog_seconds == pytest.approx(0.0)
 
-        # Simulate transcription taking far longer than the window.
         feed_both(cap, clock, seconds=5.0)
-        second = cap.get_window(timeout=0)
-        assert second is not None
-        assert second.dropped_seconds == pytest.approx(3.0)
+        win = cap.get_window(timeout=0)
+        # One step consumed of the five that arrived.
+        assert win.backlog_seconds == pytest.approx(4.0, abs=0.11)
+        assert win.dropped_seconds == 0.0, "behind is not the same as lost"
 
-    def test_keeping_up_reports_no_drops(self):
+    def test_keeping_up_reports_no_backlog(self):
         clock = FakeClock()
         cap = make_capture(clock, window=2.0, step=1.0)
         for _ in range(5):
@@ -299,6 +345,34 @@ class TestDropDetection:
             win = cap.get_window(timeout=0)
             assert win is not None
             assert win.dropped_seconds == 0.0
+            assert win.backlog_seconds == pytest.approx(0.0, abs=0.11)
+
+    def test_a_backlog_is_drained_by_flush_at_the_end(self):
+        """A meeting that ends while transcription is behind must still get the
+        rest of its audio, not have it thrown away with the session."""
+        clock = FakeClock()
+        cap = make_capture(clock, window=2.0, step=1.0)
+        feed_both(cap, clock, seconds=4.0)
+        cap.get_window(timeout=0)
+
+        remaining = []
+        while True:
+            win = cap.get_window(timeout=0)
+            if win is None:
+                break
+            remaining.append(win)
+        tail = cap.flush()
+
+        covered = sum(w.duration for w in remaining[-1:]) if remaining else 0
+        assert remaining, "the backlog is still readable"
+        assert tail is None or tail.duration > 0
+        assert covered > 0
+
+    def test_everything_captured_reaches_the_spool(self):
+        clock = FakeClock()
+        cap = make_capture(clock, window=2.0, step=1.0)
+        feed_both(cap, clock, seconds=10.0)
+        assert cap.spool.seconds_written == pytest.approx(10.0, abs=0.11)
 
 
 class TestFlush:
@@ -313,7 +387,7 @@ class TestFlush:
         feed_both(cap, clock, seconds=0.5, mic_value=0.7)
         tail = cap.flush()
         assert tail is not None
-        assert tail.mic.max() == pytest.approx(0.7)
+        assert tail.mic.max() == pytest.approx(0.7, abs=PCM_TOL)
 
     def test_flush_is_empty_when_nothing_new_arrived(self):
         clock = FakeClock()

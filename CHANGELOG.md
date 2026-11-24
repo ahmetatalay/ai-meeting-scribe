@@ -1,5 +1,72 @@
 # Changelog
 
+## 2.5.0 — 2026-11-24
+
+### Changed
+
+- **Captured audio is spooled to disk, so falling behind no longer loses it.**
+  This is the architectural fix behind the warning added in 2.4.1. Windows
+  used to be read from a 30-second ring buffer addressed by wall clock: when
+  transcription could not keep up, the next read skipped ahead and whatever
+  sat in the middle was overwritten before anyone had looked at it. Measured
+  on a passively cooled MacBook Air running `large-v3`, a single cycle
+  reported 117 seconds of audio gone, twenty-five times over, with matching
+  holes in the transcript.
+
+  Audio is small — 16kHz stereo int16 is 64KB a second, 230MB an hour — so
+  disk absorbs any backlog a laptop can produce. Capture appends to a plain
+  WAV; transcription reads at a cursor that advances independently of the
+  clock. A machine managing 0.8x realtime now finishes late instead of
+  destroying what it could not reach in time, and stopping drains the rest
+  rather than discarding it. Verified end to end: twenty seconds of marked
+  audio fed to a consumer that never ran produced ten windows covering every
+  second, none dropped.
+
+  The spool is **deleted once the transcript is written**. A recording of a
+  meeting is more sensitive than a transcript of it, and keeping one
+  unintentionally is the worse failure. `--keep-audio`, or the checkbox in
+  the web UI, keeps it beside the transcript — useful for re-running a better
+  model later instead of losing the meeting.
+
+- **Falling behind is reported as a delay, not a loss.** The warning now says
+  how far behind transcription is and that nothing is lost, and withdraws
+  itself once caught up. `dropped_seconds` is retained and still reported,
+  because it should now always be zero and would indicate a real defect.
+
+### Added
+
+- **`scribe doctor --speed` measures this machine and recommends a model.**
+  Timing one window per model answers "will this keep up here" before a
+  meeting rather than twenty-five windows into one. The budget is the step,
+  not the window: a window is produced every step seconds, so each must
+  finish within one step — which is why keeping up needs twice realtime at
+  the defaults.
+
+  Measured on an M5 Pro at a 30s window and 15s step: `tiny` 0.83s, `small`
+  5.24s, `large-v3-turbo` 7.61s, `large-v3` 17.04s — so `large-v3` falls
+  behind on fast hardware, let alone a fanless laptop. Recommends the best
+  model with real headroom rather than the best that merely fits, since the
+  numbers come from an idle machine and a fanless one slows down once a
+  meeting has been running a while.
+
+  Two things this check got wrong while being built, both measured: timing
+  against noise makes every model look instant, because the voice-activity
+  filter strips it before the encoder (0.00s against 4.59s for speech); and
+  timing against thirty unbroken seconds of speech overstates the cost badly
+  enough to recommend `tiny` on a machine that runs `small` comfortably
+  (`small` measured 21.8s that way against 5.2s at realistic density).
+
+- **The step widens automatically when transcription falls behind**, and
+  narrows back once it catches up. `--no-adaptive-step` turns this off.
+
+  Each second of audio is transcribed `window / step` times, and the extra
+  pass is what pays for correcting the previous window's boundary guess:
+  `align_tail()` only replaces a batch it re-transcribes in full, which needs
+  `window >= 2 * step`. The factor of two is therefore the correction's price
+  rather than slack to be tuned away — widening the step past half the window
+  does not reduce correction, it ends it. That makes it the right thing to
+  give up under pressure, and the notice says so when it happens.
+
 ## 2.4.1 — 2026-11-23
 
 ### Fixed

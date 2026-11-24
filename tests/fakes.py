@@ -34,6 +34,7 @@ def make_window(
     seed: int = 0,
     dropped: float = 0.0,
     meeting_silent: bool = False,
+    backlog: float = 0.0,
 ) -> Window:
     """A window in which ``speaker`` talks between 1s and 8s.
 
@@ -61,13 +62,15 @@ def make_window(
         end_time=float(seed),
         sample_rate=SR,
         dropped_seconds=dropped,
+        backlog_seconds=backlog,
     )
 
 
 class FakeCapture:
     """Serves a scripted list of windows, then reports itself stopped."""
 
-    def __init__(self, windows, tail=None, stalled=None):
+    def __init__(self, windows, tail=None, stalled=None, backlog=0.0,
+                 step_duration=15.0):
         self._windows = list(windows)
         self._tail = tail
         self._stalled = stalled or []
@@ -75,6 +78,13 @@ class FakeCapture:
         self.started = False
         self.flushed = False
         self._exhausted = threading.Event()
+        # The spool interface. backlog_seconds is scriptable so the
+        # falling-behind paths can be exercised without real audio.
+        self.backlog_seconds = backlog
+        self.step_duration = step_duration
+        self.step_changes = []
+        self.spool_kept_to = None
+        self.spool_discarded = False
 
     def start(self):
         self.started = True
@@ -105,6 +115,21 @@ class FakeCapture:
     @property
     def stalled_streams(self):
         return self._stalled
+
+    def set_step(self, step_duration):
+        self.step_duration = step_duration
+        self.step_changes.append(step_duration)
+
+    def keep_spool(self, destination):
+        from pathlib import Path
+
+        self.spool_kept_to = Path(destination)
+        self.spool_kept_to.parent.mkdir(parents=True, exist_ok=True)
+        self.spool_kept_to.write_bytes(b"")
+        return self.spool_kept_to
+
+    def discard_spool(self):
+        self.spool_discarded = True
 
 
 class ScriptedTranscriber:
@@ -145,6 +170,7 @@ def build_session(
     stalled=None,
     rejected=0,
     collapsed=0,
+    backlog=0.0,
     **cfg_kwargs,
 ):
     """A RecordingSession wired to fakes. Returns (session, capture, transcriber)."""
@@ -155,7 +181,8 @@ def build_session(
     cfg_kwargs.setdefault("level_interval", 0.01)
     config = SessionConfig(raw_dir=tmp_path, **cfg_kwargs)
 
-    capture = FakeCapture(windows, tail=tail, stalled=stalled)
+    capture = FakeCapture(windows, tail=tail, stalled=stalled, backlog=backlog,
+                          step_duration=cfg_kwargs["step"])
     transcriber = ScriptedTranscriber(script, rejected=rejected, collapsed=collapsed)
     session = RecordingSession(
         config,

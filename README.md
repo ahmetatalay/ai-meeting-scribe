@@ -209,7 +209,27 @@ export SCRIBE_RAW_DIR=~/Desktop/raw   # default output directory
 
 Measured on Apple Silicon with `int8` on an 11-second clip. Even `tiny` handles clean audio reasonably; quality problems are far more often a wrong `--language` than a small model.
 
-If transcription cannot keep up, scribe reports how many seconds of audio were lost — drop to a smaller model if you see that.
+### Will a model keep up on your machine?
+
+```bash
+scribe doctor --speed
+```
+
+This times one window per model on *your* hardware and recommends one. Worth doing once per machine, because the answer differs sharply: measured on an M5 Pro at the default 30s window and 15s step, `small` takes 5.2s and `large-v3-turbo` 7.6s, but `large-v3` takes 17.0s and cannot keep up — on fast hardware, let alone a fanless laptop that slows down as it warms.
+
+The budget is the **step**, not the window. A 30-second window is produced every 15 seconds, so each one has 15 seconds to finish, which means keeping up needs twice realtime. That factor of two is not waste: the duplicate pass is what lets the next window correct the previous one's boundary guess (see [Why text sometimes changes as you watch](#why-text-sometimes-changes-as-you-watch)), and `align_tail()` only replaces a batch it re-transcribes in full, which requires `window >= 2 × step`.
+
+### Falling behind does not lose audio
+
+Captured audio is written to disk as it arrives, and transcription reads from there at whatever pace the machine manages. So a model that is too slow finishes **late** rather than dropping what it could not reach: when you stop, scribe transcribes the remaining backlog before writing the recording.
+
+If the backlog grows, scribe also widens the step automatically — less overlap means less duplicated work. That costs boundary corrections, which is a far better trade than a transcript drifting minutes behind the conversation; the notice tells you when it happens. `--no-adaptive-step` disables it.
+
+The audio itself is **deleted once the transcript is written**, because a recording of a meeting is more sensitive than a transcript of it. Keep it with `--keep-audio` (or the checkbox in the web UI) if you might want to re-run a better model later:
+
+```bash
+scribe record --keep-audio      # leaves transcript_….wav beside the .md
+```
 
 ## How speaker detection works
 
@@ -280,7 +300,8 @@ Layout:
 | `writer.py` | Markdown + JSON sidecar output |
 | `session.py` | Recording engine — owns the loop, publishes events |
 | `main.py` | CLI, rendering the engine's event stream |
-| `doctor.py` | Audio setup diagnostics |
+| `doctor.py` | Audio setup diagnostics and the per-machine speed check |
+| `spool.py` | Durable audio buffer — lets transcription run behind the meeting |
 | `library.py` | Listing, reading, renaming and deleting transcripts |
 | `summarizer.py` | Local-LLM summaries via Ollama, with grounding prompts |
 | `related.py` | Earlier recordings sharing distinctive terms — no LLM |

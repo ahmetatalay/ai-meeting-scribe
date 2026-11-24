@@ -292,9 +292,9 @@ class TestHealthNotices:
                    if e["code"] == "dropped_audio"]
         assert notices, "the floor itself must still report"
 
-        amount = re.search(r"fell behind: (\S+) of audio",
-                           notices[0]["message"]).group(1)
-        assert float(amount.rstrip("s")) > 0, f"rendered as {amount}"
+        amount = re.search(r"(\d+(?:\.\d+)?)s", notices[0]["message"])
+        assert amount, f"no duration in {notices[0]['message']!r}"
+        assert float(amount.group(1)) > 0, f"rendered as {amount.group(0)}"
 
     def test_short_overruns_still_count_towards_the_total(self, tmp_path):
         """Not worth a banner, but the statistic should stay honest."""
@@ -381,6 +381,63 @@ class TestHealthNotices:
                   if e["code"] == "loopback_silent"]
         warnings = [e for e in silent if not e.get("resolved")]
         assert len(warnings) == 2, f"expected two warnings, got {len(silent)}"
+
+    def test_being_behind_is_reported_as_delay_not_loss(self, tmp_path):
+        """The old warning announced destroyed audio and told you to change
+        model. Audio is spooled now, so the honest message is a delay."""
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, _, _ = build(
+            tmp_path, ["some speech"],
+            [make_window(backlog=BACKLOG_WARN_SECONDS + 10)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        notices = [e for e in of_type(drain(q), "notice")
+                   if e["code"] == "backlog"]
+        assert notices, "falling behind must still be surfaced"
+        assert "Nothing is lost" in notices[0]["message"]
+        assert "behind the meeting" in notices[0]["message"]
+
+    def test_a_small_backlog_is_not_reported(self, tmp_path):
+        """One slow cycle is not a trend and must not raise a banner."""
+        session, _, _ = build(
+            tmp_path, ["some speech"], [make_window(backlog=3.0)]
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        assert [e for e in of_type(drain(q), "notice")
+                if e["code"] == "backlog"] == []
+
+    def test_catching_up_withdraws_the_backlog_warning(self, tmp_path):
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, _, _ = build(
+            tmp_path,
+            ["first stretch of speech", "second stretch entirely different"],
+            [make_window(seed=0, backlog=BACKLOG_WARN_SECONDS + 10),
+             make_window(seed=10, backlog=0.0)],
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        notices = [e for e in of_type(drain(q), "notice")
+                   if e["code"] == "backlog"]
+        assert len(notices) == 2
+        assert notices[1]["resolved"] is True
+
+    def test_backlog_is_recorded_in_the_statistics(self, tmp_path):
+        session, _, _ = build(
+            tmp_path, ["some speech"], [make_window(backlog=22.0)]
+        )
+        session.start()
+        session.wait(timeout=5)
+        assert session.stats.backlog_seconds == pytest.approx(22.0)
 
     def test_a_stalled_stream_is_reported_once(self, tmp_path):
         session, _, _ = build(
@@ -806,3 +863,190 @@ class TestAutomaticNotesAreOptIn:
         session._start_notes_worker()
         assert session._notes_thread is not None
         session._stop_requested.set()
+
+
+class TestAdaptiveStep:
+    """Overlap is duplicated work: at a 30s window and 15s step every second
+    of audio is transcribed twice. Giving some of it up is far cheaper than
+    letting the transcript fall minutes behind the conversation."""
+
+    def test_falling_behind_widens_the_step(self, tmp_path):
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, capture, _ = build(
+            tmp_path, ["some speech"],
+            [make_window(backlog=BACKLOG_WARN_SECONDS + 10)],
+            step=5.0, window=10.0,
+        )
+        session.start()
+        session.wait(timeout=5)
+
+        assert capture.step_changes, "the step should have been widened"
+        assert capture.step_changes[0] > 5.0
+
+    def test_the_step_never_exceeds_the_window(self, tmp_path):
+        """A step wider than the window would skip audio outright."""
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, capture, _ = build(
+            tmp_path, ["a", "b different", "c different again", "d more still"],
+            [make_window(seed=i * 10, backlog=BACKLOG_WARN_SECONDS + 100)
+             for i in range(4)],
+            step=8.0, window=10.0,
+        )
+        session.start()
+        session.wait(timeout=5)
+
+        assert all(s <= 10.0 for s in capture.step_changes), capture.step_changes
+
+    def test_keeping_up_leaves_the_step_alone(self, tmp_path):
+        session, capture, _ = build(
+            tmp_path, ["some speech"], [make_window(backlog=0.0)],
+            step=5.0, window=10.0,
+        )
+        session.start()
+        session.wait(timeout=5)
+        assert capture.step_changes == []
+
+    def test_catching_up_restores_the_step(self, tmp_path):
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, capture, _ = build(
+            tmp_path,
+            ["first stretch", "second entirely different stretch"],
+            [make_window(seed=0, backlog=BACKLOG_WARN_SECONDS + 10),
+             make_window(seed=10, backlog=0.0)],
+            step=5.0, window=10.0,
+        )
+        session.start()
+        session.wait(timeout=5)
+
+        assert len(capture.step_changes) >= 2
+        assert capture.step_changes[-1] == pytest.approx(5.0)
+
+    def test_adaptation_can_be_turned_off(self, tmp_path):
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, capture, _ = build(
+            tmp_path, ["some speech"],
+            [make_window(backlog=BACKLOG_WARN_SECONDS + 10)],
+            step=5.0, window=10.0, adaptive_step=False,
+        )
+        session.start()
+        session.wait(timeout=5)
+        assert capture.step_changes == []
+
+
+class TestCapturedAudioRetention:
+    """A recording of a meeting is more sensitive than a transcript of it, so
+    the audio goes away unless it is asked for."""
+
+    def test_the_audio_is_deleted_by_default(self, tmp_path):
+        session, capture, _ = build(tmp_path, ["some speech"], [make_window()])
+        session.start()
+        session.wait(timeout=5)
+
+        assert capture.spool_discarded is True
+        assert capture.spool_kept_to is None
+
+    def test_the_audio_can_be_kept_beside_the_transcript(self, tmp_path):
+        session, capture, _ = build(
+            tmp_path, ["some speech"], [make_window()], keep_audio=True
+        )
+        session.start()
+        session.wait(timeout=5)
+
+        assert capture.spool_kept_to is not None
+        assert capture.spool_kept_to.suffix == ".wav"
+        assert capture.spool_kept_to.stem == session.writer.path.stem, \
+            "the audio should be findable from the transcript name"
+        assert capture.spool_discarded is False
+
+    def test_a_failed_keep_falls_back_to_deleting(self, tmp_path):
+        """Never leave a recording lying around because a move failed."""
+        session, capture, _ = build(
+            tmp_path, ["some speech"], [make_window()], keep_audio=True
+        )
+
+        def boom(destination):
+            raise OSError("no space left on device")
+
+        capture.keep_spool = boom
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        assert capture.spool_discarded is True
+        codes = [e["code"] for e in of_type(drain(q), "notice")]
+        assert "audio_keep_failed" in codes
+
+
+class TestBacklogIsDrainedBeforeFinishing:
+    def test_stopping_announces_the_remaining_work(self, tmp_path):
+        """A meeting that ends ten minutes behind takes ten more minutes and
+        loses nothing; saying so beats looking frozen."""
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, capture, _ = build(
+            tmp_path, ["some speech"], [make_window()]
+        )
+        capture.backlog_seconds = BACKLOG_WARN_SECONDS + 60
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        drains = [e for e in of_type(drain(q), "notice")
+                  if e["code"] == "draining"]
+        assert drains, "the remaining backlog should be announced"
+        assert "still to process" in drains[0]["message"]
+
+    def test_no_announcement_when_there_is_nothing_left(self, tmp_path):
+        session, _, _ = build(tmp_path, ["some speech"], [make_window()])
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        assert [e for e in of_type(drain(q), "notice")
+                if e["code"] == "draining"] == []
+
+
+class TestTheOverlapTaxIsStructural:
+    """Each second of audio is transcribed window/step times, and the extra
+    pass is what pays for boundary correction: align_tail() only replaces a
+    batch it re-transcribes in full, which needs window >= 2 * step. So the
+    factor of two is the correction's price, not slack to tune away — a point
+    worth pinning, because tuning it away looks like free throughput.
+    """
+
+    def test_the_default_configuration_can_revise(self, tmp_path):
+        session, _, _ = build(tmp_path, [], [], window=30.0, step=15.0)
+        assert session._revision_possible(15.0)
+
+    def test_widening_past_half_the_window_ends_revision(self, tmp_path):
+        session, _, _ = build(tmp_path, [], [], window=30.0, step=15.0)
+        assert not session._revision_possible(16.0)
+        assert not session._revision_possible(30.0)
+
+    def test_the_cost_ratio_is_window_over_step(self, tmp_path):
+        """2.0x realtime at the defaults, which is why large-v3 — measured at
+        exactly 2.0x on an M5 Pro — cannot keep up even on fast hardware."""
+        session, _, _ = build(tmp_path, [], [], window=30.0, step=15.0)
+        assert session.config.window / session.config.step == pytest.approx(2.0)
+
+    def test_losing_revision_is_stated_when_it_happens(self, tmp_path):
+        from scribe_audio.session import BACKLOG_WARN_SECONDS
+
+        session, _, _ = build(
+            tmp_path, ["some speech"],
+            [make_window(backlog=BACKLOG_WARN_SECONDS + 10)],
+            window=10.0, step=5.0,
+        )
+        q = session.bus.subscribe()
+        session.start()
+        session.wait(timeout=5)
+
+        widened = [e for e in of_type(drain(q), "notice")
+                   if e["code"] == "step_widened"]
+        assert widened
+        assert widened[0]["revision_disabled"] is True
+        assert "corrections are off" in widened[0]["message"]

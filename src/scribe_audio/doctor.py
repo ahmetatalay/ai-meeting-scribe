@@ -20,6 +20,8 @@ import subprocess
 import threading
 import time
 
+from pathlib import Path
+
 import numpy as np
 
 from .capture import find_device, get_system_audio, list_devices
@@ -87,12 +89,140 @@ def measure_microphone(device_id: int, seconds: float = 4.0) -> dict:
     }
 
 
-def run_doctor() -> None:
+# Long enough that the synthesiser fills a 30-second window on its own, with
+# its own sentence pauses. Tiling a shorter clip instead produced thirty
+# seconds of unbroken speech, which is not what a meeting sounds like: it made
+# `small` measure 21.8s against 4.5s for the same text at realistic density,
+# and recommended `tiny` on a machine that runs `small` comfortably.
+SPEECH_SAMPLE = (
+    "The migration project is going reasonably well so far. We finished the "
+    "first phase last night and the team is now looking at the second one. "
+    "There are a few open questions about the database layer, particularly "
+    "around how we handle the cutover without any downtime at all. "
+    "I think we should go through the rollback plan in more detail before "
+    "anyone commits to a date, because the last time we attempted something "
+    "along these lines it took considerably longer than we expected. "
+    "The other thing worth raising is the monitoring story. At the moment we "
+    "have very little visibility into the replication lag, and without that "
+    "we would not know the cutover had gone wrong until users told us."
+)
+
+# Fraction of the window the measurement clip should actually contain speech.
+# Meetings have pauses and the voice-activity filter skips them before the
+# encoder runs — measured here, a near-silent window costs 0.00s against
+# 4.59s for speech — so a wall-to-wall clip overstates the real cost.
+SPEECH_DENSITY = 0.8
+
+# Fastest first, so a slow machine has produced a usable recommendation before
+# it reaches the models that will disappoint it.
+BENCHMARK_MODELS = ("tiny", "small", "large-v3-turbo", "medium", "large-v3")
+
+# Worst to best, which is a *different* order from the one above and must stay
+# separate: large-v3-turbo measured faster than medium (7.33s against 9.14s on
+# the same window) as well as being the better model, so ranking by speed
+# would recommend medium over a model that beats it on both counts.
+MODEL_QUALITY = ("tiny", "base", "small", "medium", "large-v3-turbo", "large-v3")
+
+
+def _speech_clip(seconds: float, sample_rate: int = 16000):
+    """Real speech of about ``seconds`` length, synthesised locally.
+
+    Benchmarking on noise is worthless: the VAD strips it before the encoder
+    runs, so every model looks instant. Measured here, a near-silent window
+    costs 0.00s against 4.59s for speech on `small`. macOS ships a speech
+    synthesiser, so a representative clip needs no bundled audio file.
+    """
+    import subprocess
+    import tempfile
+    import wave
+
+    import numpy as np
+
+    with tempfile.TemporaryDirectory() as tmp:
+        aiff = Path(tmp) / "s.aiff"
+        wav = Path(tmp) / "s.wav"
+        subprocess.run(["say", "-o", str(aiff), SPEECH_SAMPLE],
+                       check=True, capture_output=True, timeout=60)
+        subprocess.run(["afconvert", "-f", "WAVE", "-d",
+                        f"LEI16@{sample_rate}", "-c", "1", str(aiff), str(wav)],
+                       check=True, capture_output=True, timeout=60)
+        with wave.open(str(wav)) as w:
+            audio = (np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+                     .astype(np.float32) / 32768.0)
+
+    want = int(seconds * sample_rate)
+    speech_frames = int(want * SPEECH_DENSITY)
+    if audio.size > speech_frames:
+        audio = audio[:speech_frames]
+    elif audio.size < speech_frames:
+        audio = np.tile(audio, int(np.ceil(speech_frames / audio.size)))
+        audio = audio[:speech_frames]
+
+    clip = np.zeros(want, dtype=np.float32)
+    clip[:audio.size] = audio
+    return clip
+
+
+def benchmark_models(window: float = 30.0, step: float = 15.0,
+                     models=BENCHMARK_MODELS) -> list[dict]:
+    """Time one window per model and say which can keep up on this machine.
+
+    The budget is the step, not the window: a window is produced every step
+    seconds, so transcription has that long to finish one. At the defaults
+    that is 30 seconds of audio every 15, which is why keeping up needs twice
+    realtime and why a model measured at exactly 2.0x does not.
+    """
+    import time
+
+    from .transcriber import Transcriber
+
+    audio = _speech_clip(window)
+    results = []
+    for name in models:
+        try:
+            model = Transcriber(model_size=name)
+            model.load()
+            model.transcribe_segments(audio)            # warm the graph
+            start = time.perf_counter()
+            model.transcribe_segments(audio)
+            elapsed = time.perf_counter() - start
+            results.append({
+                "model": name,
+                "seconds": elapsed,
+                "realtime_factor": window / elapsed if elapsed else float("inf"),
+                "keeps_up": elapsed < step,
+                "headroom": step / elapsed if elapsed else float("inf"),
+            })
+        except Exception as exc:
+            results.append({"model": name, "error": f"{type(exc).__name__}: {exc}"})
+    return results
+
+
+def recommend_model(results: list[dict], safety: float = 1.5) -> str | None:
+    """The best model with real headroom, not merely the best that fits.
+
+    A model that only just fits will stop fitting: these numbers come from an
+    idle machine, and a passively cooled laptop loses speed to throttling once
+    a meeting has been running for a while.
+    """
+    usable = [
+        r for r in results
+        if not r.get("error") and r.get("headroom", 0) >= safety
+    ]
+    if not usable:
+        return None
+    quality = {name: i for i, name in enumerate(MODEL_QUALITY)}
+    return max(usable, key=lambda r: quality.get(r["model"], -1))["model"]
+
+
+def run_doctor(benchmark: bool = False, window: float = 30.0,
+               step: float = 15.0) -> None:
     print(f"\n{BOLD}scribe doctor{RESET}\n")
+    total = 6 if benchmark else 5
     failures = 0
 
     # 1. Loopback device -----------------------------------------------------
-    print(f"{BOLD}[1/5] Loopback device{RESET}")
+    print(f"{BOLD}[1/{total}] Loopback device{RESET}")
     loopback = find_device(LOOPBACK_NAME, "input")
     if loopback:
         print(f"  {PASS}  {loopback.name} (device {loopback.id}, "
@@ -103,7 +233,7 @@ def run_doctor() -> None:
         failures += 1
 
     # 2. Output routing ------------------------------------------------------
-    print(f"\n{BOLD}[2/5] System output routing{RESET}")
+    print(f"\n{BOLD}[2/{total}] System output routing{RESET}")
     output = get_system_audio()["output"]
     out_name = output.name if output else "None"
     print(f"  Output: {BOLD}{out_name}{RESET}")
@@ -122,7 +252,7 @@ def run_doctor() -> None:
     print("    is the most common cause of a one-sided transcript.")
 
     # 3. Loopback carries audio ---------------------------------------------
-    print(f"\n{BOLD}[3/5] Loopback passes audio{RESET}")
+    print(f"\n{BOLD}[3/{total}] Loopback passes audio{RESET}")
     if loopback:
         try:
             rms = _test_loopback(loopback.name)
@@ -138,7 +268,7 @@ def run_doctor() -> None:
         failures += 1
 
     # 4. Microphone ----------------------------------------------------------
-    print(f"\n{BOLD}[4/5] Microphone{RESET}")
+    print(f"\n{BOLD}[4/{total}] Microphone{RESET}")
     default_in = get_system_audio()["input"]
     if default_in:
         print(f"  {PASS}  Default input: {default_in.name}")
@@ -156,7 +286,7 @@ def run_doctor() -> None:
             print(f"    - {d.name}")
 
     # 5. Microphone level ----------------------------------------------------
-    print(f"\n{BOLD}[5/5] Microphone level{RESET}")
+    print(f"\n{BOLD}[5/{total}] Microphone level{RESET}")
     if default_in is not None:
         print(f"  {BOLD}Speak normally for 4 seconds, starting now...{RESET}")
         try:
@@ -178,6 +308,42 @@ def run_doctor() -> None:
             print(f"  {WARN}  Could not measure: {exc}")
     else:
         print(f"  {WARN}  Skipped — no default input device")
+
+    # 6. Transcription speed -------------------------------------------------
+    if benchmark:
+        print(f"\n{BOLD}[6/{total}] Transcription speed on this machine{RESET}")
+        print(f"  A {window:.0f}s window is produced every {step:.0f}s, so each "
+              f"one must finish\n  inside {step:.0f}s to keep up live. "
+              f"Measuring, this takes a minute...")
+        try:
+            results = benchmark_models(window=window, step=step)
+            print()
+            print(f"  {'model':16s} {'per window':>11s} {'xRT':>7s}  verdict")
+            for r in results:
+                if r.get("error"):
+                    print(f"  {r['model']:16s} {r['error']}")
+                    continue
+                verdict = (f"{GREEN}keeps up{RESET}" if r["keeps_up"]
+                           else f"{RED}falls behind{RESET}")
+                print(f"  {r['model']:16s} {r['seconds']:10.2f}s "
+                      f"{r['realtime_factor']:6.1f}x  {verdict}")
+
+            best = recommend_model(results)
+            print()
+            if best is None:
+                print(f"  {WARN}  No model keeps up comfortably here. Recording "
+                      f"still loses\n         nothing — audio is spooled to disk "
+                      f"and transcription\n         finishes after you stop.")
+            else:
+                print(f"  {PASS}  Recommended: {BOLD}--model {best}{RESET}")
+                print(f"         Chosen with headroom to spare: these numbers "
+                      f"come from an\n         idle machine, and a fanless "
+                      f"laptop slows down once a\n         meeting has been "
+                      f"running for a while.")
+        except FileNotFoundError:
+            print(f"  {WARN}  Skipped — needs macOS 'say' and 'afconvert'")
+        except Exception as exc:
+            print(f"  {WARN}  Could not measure: {exc}")
 
     # Summary ----------------------------------------------------------------
     print(f"\n{BOLD}{'=' * 56}{RESET}")

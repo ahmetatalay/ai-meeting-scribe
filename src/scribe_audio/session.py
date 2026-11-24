@@ -57,6 +57,14 @@ SILENT_LOOPBACK_WINDOWS = 2
 # late is normal scheduling jitter and loses no audio worth naming.
 DROPPED_AUDIO_FLOOR = 1.0
 
+# How far transcription may fall behind the meeting before saying so. One
+# window plus a step: less than that is a single slow cycle, not a trend.
+BACKLOG_WARN_SECONDS = 45.0
+# Hysteresis, so a backlog hovering at the threshold does not flicker.
+BACKLOG_CLEAR_SECONDS = 15.0
+# How much the step grows, or shrinks back, in one adjustment.
+STEP_WIDEN_FACTOR = 1.5
+
 # Per-subscriber queue depth. A slow consumer loses the oldest events rather
 # than stalling the capture loop.
 QUEUE_DEPTH = 512
@@ -85,6 +93,17 @@ class SessionConfig:
     # turn automatic refresh back on.
     notes_interval: float = 0.0
     notes_min_new_words: int = 40
+    # Captured audio is spooled to disk so transcription can run behind the
+    # meeting without losing anything. Deleting it afterwards is the default:
+    # a recording is more sensitive than a transcript of it. Keeping it lets
+    # you re-run a better model later instead of losing the meeting.
+    keep_audio: bool = False
+    # Stopping normally finishes the spooled backlog first. This abandons it
+    # instead, for a caller that needs the session to end promptly.
+    abandon_backlog: bool = False
+    # Widen the step when transcription cannot keep up: less overlap means
+    # less work per second of audio, so quality degrades before latency does.
+    adaptive_step: bool = True
 
     def __post_init__(self):
         if self.mic_device is None and self.system_device is None:
@@ -97,6 +116,7 @@ class SessionStats:
     segments: int = 0
     words: int = 0
     dropped_seconds: float = 0.0
+    backlog_seconds: float = 0.0
     rejected_segments: int = 0
     collapsed_segments: int = 0
     speakers: dict[str, int] = field(default_factory=dict)
@@ -221,6 +241,7 @@ class RecordingSession:
         self._reported_stalls: set[str] = set()
         self._silent_windows = 0
         self._warned_silent = False
+        self._warned_backlog = False
         self._announced_path = False
         self._announced_language = False
 
@@ -456,12 +477,14 @@ class RecordingSession:
             self._set_state(STATE_STOPPING)
         try:
             if self.capture is not None:
+                self._drain_backlog()
                 tail = self.capture.flush()
                 if tail is not None:
                     # The last partial window; without this every transcript
                     # ends mid-sentence.
                     self._handle_window(tail, final=True)
                 self.capture.stop()
+                self._settle_spool()
         except Exception as exc:
             self.bus.publish({
                 "type": "notice",
@@ -492,6 +515,160 @@ class RecordingSession:
             self._set_state(STATE_STOPPED)
         else:
             self._set_state(STATE_ERROR, error=self._error)
+
+    def _report_backlog(self, behind: float) -> None:
+        """Say how far behind transcription is, and withdraw it once caught up.
+
+        This replaces a warning that announced destroyed audio. Nothing is
+        destroyed now, so the honest message is a delay — but it still has to
+        be said, because a live transcript silently drifting minutes behind the
+        conversation would otherwise look like the meeting had gone quiet.
+        """
+        if behind >= BACKLOG_WARN_SECONDS:
+            if not self._warned_backlog:
+                self._warned_backlog = True
+            self.bus.publish({
+                "type": "notice",
+                "level": "warning",
+                "code": "backlog",
+                "seconds": round(behind, 1),
+                "message": (
+                    f"Transcription is {behind:.0f}s behind the meeting. "
+                    f"Nothing is lost — it will finish after you stop. "
+                    f"A smaller model would keep up live."
+                ),
+            })
+        elif self._warned_backlog and behind < BACKLOG_CLEAR_SECONDS:
+            self._warned_backlog = False
+            self.bus.publish({
+                "type": "notice",
+                "level": "info",
+                "code": "backlog",
+                "resolved": True,
+                "message": "Transcription has caught up.",
+            })
+
+    def _adapt_step(self, behind: float) -> None:
+        """Trade boundary correction for throughput when the machine lags.
+
+        Each second of audio is transcribed window/step times. At the default
+        30s window and 15s step that is exactly twice, and the duplicate pass
+        is what pays for correcting the previous window's boundary guess —
+        align_tail() only replaces a batch it re-transcribes *in full*, which
+        requires window >= 2 * step. So the factor-of-two is the price of the
+        correction rather than slack to be tuned away: widening the step past
+        half the window does not reduce correction, it ends it.
+
+        That makes it the right thing to give up under pressure. Losing
+        boundary fixes costs a few words at window edges; falling minutes
+        behind costs the point of a live transcript.
+        """
+        if not self.config.adaptive_step or self.capture is None:
+            return
+
+        step = self.capture.step_duration
+        if behind >= BACKLOG_WARN_SECONDS and step < self.config.window:
+            widened = min(self.config.window, step * STEP_WIDEN_FACTOR)
+            if widened > step + 0.01:
+                self.capture.set_step(widened)
+                revision_lost = (
+                    self._revision_possible(step)
+                    and not self._revision_possible(widened)
+                )
+                detail = (
+                    " Window-boundary corrections are off while catching up."
+                    if revision_lost else ""
+                )
+                self.bus.publish({
+                    "type": "notice",
+                    "level": "info",
+                    "code": "step_widened",
+                    "step": round(widened, 1),
+                    "revision_disabled": revision_lost,
+                    "message": (
+                        f"Transcribing every {widened:.0f}s instead of "
+                        f"{step:.0f}s to catch up.{detail}"
+                    ),
+                })
+        elif behind <= BACKLOG_CLEAR_SECONDS and step > self.config.step:
+            restored = max(self.config.step, step / STEP_WIDEN_FACTOR)
+            if restored < step - 0.01:
+                self.capture.set_step(restored)
+
+    def _revision_possible(self, step: float) -> bool:
+        """Whether a window at this step can replace the previous batch.
+
+        align_tail() requires the new window to cover the whole previous
+        batch, so the overlap must be at least a full step.
+        """
+        return self.config.window >= 2 * step - 1e-9
+
+    def _drain_backlog(self) -> None:
+        """Transcribe whatever is still spooled before finishing.
+
+        On a machine that cannot keep up this is where the recording catches
+        up: the audio was never lost, so stopping must mean "finish the rest",
+        not "discard it". A meeting that ended ten minutes behind takes ten
+        more minutes of transcription and loses nothing.
+        """
+        assert self.capture is not None
+        behind = self.capture.backlog_seconds
+        if behind < self.config.step:
+            return
+
+        self.bus.publish({
+            "type": "notice",
+            "level": "info",
+            "code": "draining",
+            "seconds": round(behind, 1),
+            "message": (
+                f"Finishing transcription: {behind:.0f}s of recorded audio "
+                f"still to process."
+            ),
+        })
+
+        while True:
+            window = self.capture.flush() if self.capture.is_stopped else \
+                self.capture.get_window(timeout=0)
+            if window is None:
+                break
+            self._handle_window(window)
+            if self._stop_requested.is_set() and self.config.abandon_backlog:
+                break
+
+    def _settle_spool(self) -> None:
+        """Keep or delete the captured audio, as configured.
+
+        Deleting is the default: a recording of a meeting is more sensitive
+        than a transcript of it, and keeping one unintentionally is the worse
+        failure. Keeping it is useful when transcription quality disappointed
+        and you would rather re-run a better model than lose the meeting.
+        """
+        assert self.capture is not None
+        if not self.config.keep_audio:
+            self.capture.discard_spool()
+            return
+
+        if self.writer is None or self.writer.path is None:
+            self.capture.discard_spool()
+            return
+        try:
+            kept = self.capture.keep_spool(self.writer.path.with_suffix(".wav"))
+            self.bus.publish({
+                "type": "notice",
+                "level": "info",
+                "code": "audio_kept",
+                "path": str(kept),
+                "message": f"Audio kept at {kept.name}",
+            })
+        except OSError as exc:
+            self.bus.publish({
+                "type": "notice",
+                "level": "warning",
+                "code": "audio_keep_failed",
+                "message": f"Could not keep the audio: {exc}",
+            })
+            self.capture.discard_spool()
 
     def _persist_notes(self) -> None:
         """Keep the running summary with the recording once it stops."""
@@ -678,11 +855,9 @@ class RecordingSession:
     def _check_health(self, window: Window) -> None:
         assert self.capture is not None
 
-        # Sub-second overruns are scheduling jitter on a 30-second window, not
-        # audio anyone lost, and they produced a stream of warnings reading
-        # "fell behind: 0s ... try a smaller model" — alarming, unactionable
-        # and wrong. Only a real shortfall is worth saying, and it is never
-        # rendered as "0s".
+        # Audio is spooled to disk, so falling behind is a delay rather than a
+        # loss and dropped_seconds should now always be zero. It is still
+        # reported if it ever is not, because that would mean a real defect.
         if window.dropped_seconds > 0:
             self.stats.dropped_seconds += window.dropped_seconds
         if window.dropped_seconds >= DROPPED_AUDIO_FLOOR:
@@ -694,10 +869,14 @@ class RecordingSession:
                 "code": "dropped_audio",
                 "seconds": lost,
                 "message": (
-                    f"Transcription fell behind: {amount} of audio was not "
-                    f"transcribed. Try a smaller model."
+                    f"Audio was lost before it could be transcribed: {amount}. "
+                    f"This should not happen — please report it."
                 ),
             })
+
+        self.stats.backlog_seconds = window.backlog_seconds
+        self._report_backlog(window.backlog_seconds)
+        self._adapt_step(window.backlog_seconds)
 
         # The mis-routing signature: speech is being transcribed while the
         # loopback carries nothing, so only one side is reaching us. Requiring

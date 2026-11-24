@@ -22,11 +22,16 @@ Either stream may be absent or may die mid-recording; the other keeps working.
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+
+from .spool import AudioSpool
 
 # Capture blocks are kept short: it bounds the alignment error between the two
 # streams, and gives the level meters a responsive update rate.
@@ -195,6 +200,10 @@ class Window:
     end_time: float        # wall clock of the last sample
     sample_rate: int
     dropped_seconds: float = 0.0  # audio never analysed because we fell behind
+    # How much captured audio is still waiting to be transcribed. Unlike
+    # dropped_seconds this is not a loss: the audio is on disk and will be
+    # transcribed, just later than the meeting is happening.
+    backlog_seconds: float = 0.0
 
     @property
     def duration(self) -> float:
@@ -218,6 +227,7 @@ class DualStreamCapture:
         step_duration: float = 15.0,
         stream_factory=None,
         time_fn=time.monotonic,
+        spool_path: Path | str | None = None,
     ):
         if window_duration <= 0 or step_duration <= 0:
             raise ValueError("window and step durations must be positive")
@@ -234,8 +244,24 @@ class DualStreamCapture:
         self._time = time_fn
         self._stream_factory = stream_factory or self._open_real_stream
 
+        # Staging only: wide enough to align the two streams and to feed the
+        # level meters. Durability is the spool's job.
         self.mic_buffer = TimedRingBuffer(sample_rate, window_duration)
         self.system_buffer = TimedRingBuffer(sample_rate, window_duration)
+
+        # Aligned audio lands here and is read back by frame position, so a
+        # transcriber that cannot keep up finishes late instead of having the
+        # audio overwritten underneath it.
+        if spool_path is None:
+            self._spool_dir = tempfile.mkdtemp(prefix="scribe-spool-")
+            spool_path = Path(self._spool_dir) / "capture.wav"
+        else:
+            self._spool_dir = None
+        self.spool = AudioSpool(spool_path, sample_rate)
+        self._spooled_time: float | None = None
+        self._read_frame = 0
+        self._window_frames = int(round(window_duration * sample_rate))
+        self._step_frames = max(1, int(round(step_duration * sample_rate)))
 
         self._lock = threading.Lock()
         self._ready = threading.Condition(self._lock)
@@ -270,10 +296,65 @@ class DualStreamCapture:
                 # Time of the first *sample*, not of the first block's arrival,
                 # so the opening window is measured from when audio began.
                 self._first_time = now - block.size / self.sample_rate
+                self._spooled_time = self._first_time
             if self._latest_time is None or now > self._latest_time:
                 self._latest_time = now
+            self._drain_to_spool_locked()
             if self._window_ready_locked():
                 self._ready.notify_all()
+
+    def _pending_streams_locked(self) -> list[str]:
+        """Configured streams that have not yet delivered their first block."""
+        return [
+            name
+            for name, buf, dev in (
+                ("mic", self.mic_buffer, self.mic_device),
+                ("meeting", self.system_buffer, self.system_device),
+            )
+            if dev is not None and buf.end_time is None
+        ]
+
+    def _drain_to_spool_locked(self) -> None:
+        """Move newly aligned audio out of the rings and onto disk.
+
+        Runs on every block, so the rings only ever have to hold a block or
+        two of lag — which is why nothing can be overwritten before it is
+        spooled, however slow transcription is.
+        """
+        if self._spooled_time is None:
+            return
+
+        # A stream that has not delivered anything yet is not evidence of
+        # silence, so draining must not run ahead of it. The two callbacks fire
+        # in sequence, so on the very first block one side is always empty; the
+        # spool is append-only, which would have baked a mic-only opening into
+        # the file permanently. Waiting is bounded: a device that never
+        # delivers becomes stale below and stops holding the recording up.
+        pending = self._pending_streams_locked()
+        if pending:
+            waited = (
+                self._latest_time - self._first_time
+                if self._latest_time is not None and self._first_time is not None
+                else 0.0
+            )
+            if waited <= STALE_AFTER_SECONDS:
+                return
+
+        end = self._aligned_end_locked()
+        if end is None:
+            return
+        frames = int(round((end - self._spooled_time) * self.sample_rate))
+        if frames <= 0:
+            return
+
+        # The frame count is authoritative and time is derived from it, so the
+        # spool's length and its wall-clock span cannot drift apart.
+        duration = frames / self.sample_rate
+        chunk_end = self._spooled_time + duration
+        mic = self.mic_buffer.read_window(chunk_end, duration)
+        meeting = self.system_buffer.read_window(chunk_end, duration)
+        self.spool.append(mic, meeting)
+        self._spooled_time = chunk_end
 
     # ------------------------------------------------------------- alignment
 
@@ -319,15 +400,13 @@ class DualStreamCapture:
         return self._latest_time
 
     def _window_ready_locked(self) -> bool:
-        end = self._aligned_end_locked()
-        if end is None:
-            return False
-        # Before the first window, measure from when audio started arriving, so
-        # the opening window is not mostly zero padding.
-        reference = self._last_emit_time if self._last_emit_time is not None else self._first_time
-        if reference is None:
-            return False
-        return end - reference >= self.step_duration
+        """True once a step of audio past the read cursor is on disk.
+
+        Readiness is a question about the spool, not about the clock: a reader
+        that has fallen minutes behind has windows waiting for it and should
+        get the next one immediately.
+        """
+        return self.spool.frames_written - self._read_frame >= self._step_frames
 
     def get_window(self, timeout: float | None = None) -> Window | None:
         """Block until a step of new audio is available, then return it aligned.
@@ -344,62 +423,84 @@ class DualStreamCapture:
             if self._stopped and not self._window_ready_locked():
                 return None
 
-            end = self._aligned_end_locked()
-            assert end is not None  # guaranteed by _window_ready_locked
-            return self._build_window_locked(end)
+            return self._build_window_locked(self._read_frame + self._step_frames)
 
     def flush(self) -> Window | None:
-        """Return whatever audio has arrived since the last window.
+        """Return whatever audio has not been handed out yet.
 
         Called on shutdown so the tail of the meeting is transcribed instead of
-        being discarded, which is why recordings used to end mid-sentence.
+        being discarded, which is why recordings used to end mid-sentence. With
+        a spool this also drains a backlog: if transcription is behind when the
+        meeting ends, the remaining windows are still there to be read.
         """
         with self._lock:
-            end = self._aligned_end_locked()
-            if end is None:
+            self._drain_to_spool_locked()
+            written = self.spool.frames_written
+            if written <= self._read_frame:
                 return None
-            if self._last_emit_time is not None and end <= self._last_emit_time:
-                return None
-            return self._build_window_locked(end)
+            return self._build_window_locked(written)
 
-    def _build_window_locked(self, end: float) -> Window:
-        mic = self.mic_buffer.read_window(end, self.window_duration)
-        meeting = self.system_buffer.read_window(end, self.window_duration)
+    @property
+    def backlog_seconds(self) -> float:
+        """Captured audio not yet handed to transcription."""
+        with self._lock:
+            return self._backlog_locked()
 
-        # Drop any leading region that predates the first captured sample.
-        # Measured effect: padding does not cost words, but it does make Whisper
-        # return one long segment where trimmed audio returns several. Finer
-        # segments give speaker attribution more to work with, since each one
-        # gets its own decision. All three arrays are trimmed identically, so
-        # segment timestamps stay aligned with the attribution channels.
-        window_start = end - self.window_duration
-        if self._first_time is not None and self._first_time > window_start:
-            skip = int(round((self._first_time - window_start) * self.sample_rate))
-            skip = max(0, min(skip, mic.size - 1))
-            if skip:
-                mic = mic[skip:]
-                meeting = meeting[skip:]
+    def set_step(self, step_duration: float) -> None:
+        """Change how far the read cursor advances per window.
+
+        A wider step means less overlap between consecutive windows, which is
+        less duplicated transcription per second of audio — the lever for
+        catching up on a machine that cannot keep pace. The read cursor is
+        untouched, so changing this mid-recording skips nothing.
+        """
+        if step_duration <= 0:
+            raise ValueError("step must be positive")
+        if step_duration > self.window_duration:
+            raise ValueError("step must not exceed window")
+        with self._ready:
+            self.step_duration = step_duration
+            self._step_frames = max(1, int(round(step_duration * self.sample_rate)))
+            if self._window_ready_locked():
+                self._ready.notify_all()
+
+    def _backlog_locked(self) -> float:
+        behind = self.spool.frames_written - self._read_frame
+        return max(0.0, behind / self.sample_rate)
+
+    def _build_window_locked(self, end_frame: int) -> Window:
+        """The window of audio ending at ``end_frame`` in the spool.
+
+        Clamping the start at zero rather than zero-padding means the opening
+        windows are short instead of mostly silence. Padding never cost words,
+        but it did make Whisper return one long segment where real audio
+        returns several, and finer segments give speaker attribution a decision
+        per segment instead of one for the lot.
+        """
+        end_frame = min(end_frame, self.spool.frames_written)
+        start_frame = max(0, end_frame - self._window_frames)
+        mic, meeting = self.spool.read(start_frame, end_frame - start_frame)
 
         # Sum rather than average: averaging halves a lone speaker's level and
         # can push a quiet talker under the downstream silence gate.
         mono = np.clip(mic + meeting, -1.0, 1.0)
 
-        dropped = 0.0
-        if self._last_emit_time is not None:
-            advanced = end - self._last_emit_time
-            if advanced > self.window_duration:
-                # More time passed than the buffer holds, so some audio was
-                # overwritten before it was ever analysed.
-                dropped = advanced - self.window_duration
-        self._last_emit_time = end
+        self._read_frame = end_frame
+        backlog = self._backlog_locked()
+
+        # Derived from the spool position rather than read off the clock, so it
+        # names the audio in this window even when transcription is behind.
+        end_time = (self._first_time or 0.0) + end_frame / self.sample_rate
+        self._last_emit_time = end_time
 
         return Window(
             mono=mono,
             mic=mic,
             meeting=meeting,
-            end_time=end,
+            end_time=end_time,
             sample_rate=self.sample_rate,
-            dropped_seconds=dropped,
+            dropped_seconds=0.0,   # impossible now: the audio is on disk
+            backlog_seconds=backlog,
         )
 
     # ------------------------------------------------------------------ meters
@@ -494,3 +595,24 @@ class DualStreamCapture:
             except Exception:
                 pass
         self._streams.clear()
+        self.spool.close()
+
+    def keep_spool(self, destination: Path | str) -> Path:
+        """Move the captured audio to ``destination`` and return its path."""
+        self.spool.close()
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(self.spool.path), target)
+        return target
+
+    def discard_spool(self) -> None:
+        """Delete the captured audio.
+
+        The default once a transcript exists: a recording of a meeting is more
+        sensitive than a transcript of it, and keeping one by accident is worse
+        than having to re-record.
+        """
+        self.spool.delete()
+        if self._spool_dir is not None:
+            shutil.rmtree(self._spool_dir, ignore_errors=True)
+            self._spool_dir = None

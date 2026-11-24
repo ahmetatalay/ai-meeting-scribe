@@ -290,6 +290,7 @@ def create_app(state: AppState) -> FastAPI:
                 title=body.get("title") or None,
                 use_speakers=bool(body.get("use_speakers", True)),
                 notes_interval=state.auto_notes,
+                keep_audio=bool(body.get("keep_audio", False)),
             )
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

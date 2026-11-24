@@ -117,6 +117,8 @@ def cmd_record(args) -> None:
         mic_margin=args.mic_margin,
         use_speakers=not args.no_speakers,
         keep_filler=args.keep_filler,
+        keep_audio=args.keep_audio,
+        adaptive_step=not args.no_adaptive_step,
     )
 
     _report_routing()
@@ -237,7 +239,19 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("devices", help="List audio input and output devices")
-    sub.add_parser("doctor", help="Diagnose the audio setup")
+    p_doctor = sub.add_parser("doctor", help="Diagnose the audio setup")
+    p_doctor.add_argument(
+        "--speed", action="store_true",
+        help="Also time each Whisper model on this machine and recommend one",
+    )
+    p_doctor.add_argument(
+        "--window", type=float, default=30.0,
+        help="Window the speed check assumes (default: 30)",
+    )
+    p_doctor.add_argument(
+        "--step", type=float, default=15.0,
+        help="Step the speed check assumes — the per-window budget (default: 15)",
+    )
 
     web = sub.add_parser("web", help="Open the local web UI (loopback only)")
     web.add_argument("--port", type=int, default=None, help="Port (default: 8765)")
@@ -285,6 +299,13 @@ def main() -> None:
                      help="Disable speaker labelling")
     rec.add_argument("--keep-filler", action="store_true",
                      help="Keep low-confidence filler segments ('You', 'Thank you.')")
+    rec.add_argument("--keep-audio", action="store_true",
+                     help="Keep the captured audio beside the transcript "
+                          "(deleted by default; a recording is more sensitive "
+                          "than a transcript of it)")
+    rec.add_argument("--no-adaptive-step", action="store_true",
+                     help="Never widen the step to catch up, even when "
+                          "transcription falls behind")
     rec.add_argument("--debug", action="store_true",
                      help="Print per-segment channel energy")
     _deprecated(rec)
@@ -302,7 +323,7 @@ def main() -> None:
     if args.command == "devices":
         cmd_devices(args)
     elif args.command == "doctor":
-        run_doctor()
+        run_doctor(benchmark=args.speed, window=args.window, step=args.step)
     elif args.command == "record":
         cmd_record(args)
     elif args.command == "web":
